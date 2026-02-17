@@ -1,0 +1,54 @@
+# =============================================================================
+# Python dependencies for context-hub-mcp
+# Production-grade MCP server for AI agent context orchestration
+# =============================================================================
+
+# Web Framework
+fastapi>=0.129.0                # High-performance async web framework
+uvicorn[standard]>=0.40.0       # ASGI server for FastAPI
+pydantic>=2.12.5                # Data validation and serialization
+
+# Database
+asyncpg>=0.31.0                 # Async PostgreSQL driver for SQLAlchemy
+sqlalchemy[asyncio]>=2.0.46     # SQL toolkit and ORM with async support
+redis>=7.1.1                    # In-memory data store for short-term memory
+alembic>=1.18.4                 # Database migration tool for SQLAlchemy
+psycopg2-binary>=2.9.11         # PostgreSQL adapter (sync, for Alembic)
+
+# HTTP Client
+httpx>=0.28.1                   # Modern async HTTP client for LLM API calls
+google-generativeai>=0.8.6      # Google Gemini Python SDK
+langchain>=1.2.10               # LangChain framework
+langchain-core>=1.2.13          # Core LangChain abstractions
+langchain-community>=0.4.1      # Community integrations
+langchain-google-genai>=4.2.0   # Google Gemini for LangChain
+langchain-openai>=1.1.9         # Azure OpenAI for LangChain
+aiohttp>=3.13.3                 # Async HTTP client/server framework
+
+# Configuration
+python-dotenv>=1.2.1            # Load environment variables from .env file
+
+# Utilities
+orjson>=3.11.7                  # Fast JSON serialization/deserialization
+python-dateutil>=2.9.0          # Date/time parsing and manipulation
+
+# Logging & Monitoring
+structlog>=25.5.0               # Structured logging with context
+
+# =============================================================================
+# Development Dependencies (uncomment as needed)
+# =============================================================================
+
+# Type checking
+# mypy>=1.12.0                  # Static type checker for Python
+# types-redis>=4.6.0            # Type stubs for redis
+
+# Testing
+# pytest>=8.4.0                 # Testing framework
+# pytest-asyncio>=0.24.0        # Async test support for pytest
+# pytest-cov>=5.1.0             # Code coverage reporting
+
+# Google APIs (YouTube Analytics)
+google-api-python-client>=2.190.0  # Google API client for YouTube Analytics
+google-auth>=2.48.0                # Google authentication library
+google-auth-oauthlib>=1.2.4        # OAuth2 support for Google APIs
