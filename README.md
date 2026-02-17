@@ -110,6 +110,12 @@ creatorpilot-mcp/
 ├── Dockerfile             # Production container image
 ├── requirements.txt       # Python dependencies
 ├── README.md              # This file
+├── .gitignore             # Git ignore file
+├── alembic.ini            # Alembic configuration
+│
+├── alembic/               # Database migrations
+│   ├── env.py             # Migration environment
+│   └── versions/          # Migration scripts
 │
 ├── executor/              # Core orchestration logic
 │   ├── execute.py         # Main execution coordinator
@@ -160,6 +166,9 @@ creatorpilot-mcp/
 │
 ├── llm/                   # LLM client implementations
 │   └── langchain_azure.py # Azure OpenAI via LangChain
+│
+├── scripts/               # Utility scripts
+│   └── init_db.py         # Database initialization script
 │
 ├── tests/                 # Test suite (123 tests)
 │   ├── conftest.py        # Shared fixtures
