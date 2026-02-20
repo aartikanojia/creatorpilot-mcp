@@ -127,6 +127,37 @@ async def handle_fetch_analytics(input_data: dict[str, Any]) -> dict[str, Any]:
     postgres_store.save_analytics_snapshot(snapshot)
     logger.info(f"Analytics snapshot persisted for channel {channel_uuid}")
     
+    # Step 3b: Fetch and upsert recent videos into videos table
+    try:
+        from registry.tool_handlers.fetch_last_video_analytics import YouTubeVideoFetcher
+        
+        fetcher = YouTubeVideoFetcher(
+            access_token=access_token,
+            refresh_token=refresh_token,
+        )
+        recent_videos = fetcher.get_recent_videos(limit=10)
+        
+        if recent_videos:
+            # Resolve user_id from channel
+            user_id = channel_data.get("user_id")
+            if user_id:
+                from uuid import UUID as _UUID
+                user_uuid = _UUID(user_id) if isinstance(user_id, str) else user_id
+                result = postgres_store.upsert_videos(
+                    channel_id=channel_uuid,
+                    user_id=user_uuid,
+                    videos_data=recent_videos,
+                )
+                logger.info(
+                    f"[VideoSync] {result['inserted']} inserted, "
+                    f"{result['updated']} updated during analytics fetch"
+                )
+            else:
+                logger.warning("No user_id in channel context, skipping video upsert")
+    except Exception as video_err:
+        # Non-fatal: don't block analytics if video upsert fails
+        logger.warning(f"Video upsert during analytics fetch failed: {video_err}")
+    
     # Build output with optional comparison data
     output_data = {
         "message": "Analytics fetched and persisted successfully",

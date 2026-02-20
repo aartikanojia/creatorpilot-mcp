@@ -55,6 +55,9 @@ class LangChainAzureClient:
         """
         Generate a response using LangChain Azure OpenAI.
 
+        Falls back to Gemini automatically if Azure's content filter
+        blocks the response.
+
         Args:
             prompt: Input text prompt
 
@@ -89,5 +92,37 @@ class LangChainAzureClient:
             return str(content) if content else ""
 
         except Exception as e:
+            error_msg = str(e).lower()
+            # Detect Azure content filter and fallback to Gemini
+            if "content filter" in error_msg or "content_filter" in error_msg:
+                logger.warning(
+                    f"Azure content filter triggered, attempting Gemini fallback: {e}"
+                )
+                return self._gemini_fallback(prompt)
+
             logger.error(f"LangChain Azure OpenAI generation failed: {e}")
             return f"Error generating response: {str(e)}"
+
+    def _gemini_fallback(self, prompt: str) -> str:
+        """Retry the prompt using Gemini when Azure content filter blocks."""
+        try:
+            from llm.langchain_gemini import LangChainGeminiClient
+
+            if not config.llm.gemini_api_key:
+                logger.error("Gemini fallback unavailable: GEMINI_API_KEY not set")
+                return (
+                    "I couldn't analyze this content due to a safety filter. "
+                    "Please try rephrasing your question."
+                )
+
+            gemini = LangChainGeminiClient()
+            result = gemini.generate(prompt)
+            logger.info("Gemini fallback succeeded after Azure content filter block")
+            return result
+
+        except Exception as fallback_err:
+            logger.error(f"Gemini fallback also failed: {fallback_err}")
+            return (
+                "I couldn't analyze this content due to a safety filter. "
+                "Please try rephrasing your question."
+            )

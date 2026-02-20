@@ -1,5 +1,5 @@
 """
-Database package for context-hub-mcp.
+Database package for creatorpilot-mcp.
 
 Provides SQLAlchemy models, session management, and database utilities.
 """

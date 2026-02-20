@@ -1,5 +1,5 @@
 # =============================================================================
-# Python dependencies for context-hub-mcp
+# Python dependencies for creatorpilot-mcp
 # Production-grade MCP server for AI agent context orchestration
 # =============================================================================
 
@@ -31,6 +31,7 @@ python-dotenv>=1.2.1            # Load environment variables from .env file
 # Utilities
 orjson>=3.11.7                  # Fast JSON serialization/deserialization
 python-dateutil>=2.9.0          # Date/time parsing and manipulation
+rapidfuzz>=3.0.0                # High-performance fuzzy string matching
 
 # Logging & Monitoring
 structlog>=25.5.0               # Structured logging with context

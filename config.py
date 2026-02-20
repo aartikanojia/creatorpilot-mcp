@@ -49,11 +49,11 @@ class PostgresConfig:
     port: int = field(default_factory=lambda: int(
         os.getenv("POSTGRES_PORT", "5432")))
     user: str = field(
-        default_factory=lambda: os.getenv("POSTGRES_USER", "mcp"))
+        default_factory=lambda: os.getenv("POSTGRES_USER", "creatorpilot_admin"))
     password: Optional[str] = field(
         default_factory=lambda: os.getenv("POSTGRES_PASSWORD"))
     database: str = field(default_factory=lambda: os.getenv(
-        "POSTGRES_DB", "context_hub"))
+        "POSTGRES_DB", "creatorpilot"))
     ssl_mode: str = field(default_factory=lambda: os.getenv(
         "POSTGRES_SSL_MODE", "prefer"))
 
@@ -63,20 +63,18 @@ class PostgresConfig:
         Build PostgreSQL connection URL.
 
         Prioritizes DATABASE_URL if set, otherwise builds from components.
-        Converts to asyncpg driver format for async support.
+        Uses synchronous psycopg2 driver (MCP runs sync SQLAlchemy).
         """
         if self.database_url:
             url = self.database_url
-            # Convert postgres:// to postgresql+asyncpg:// for async support
+            # Normalize postgres:// to postgresql://
             if url.startswith("postgres://"):
-                return url.replace("postgres://", "postgresql+asyncpg://", 1)
-            elif url.startswith("postgresql://"):
-                return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+                return url.replace("postgres://", "postgresql://", 1)
             return url
 
         # Build from individual components
         auth = f"{self.user}:{self.password}@" if self.password else f"{self.user}@"
-        return f"postgresql+asyncpg://{auth}{self.host}:{self.port}/{self.database}?ssl={self.ssl_mode}"
+        return f"postgresql://{auth}{self.host}:{self.port}/{self.database}?sslmode={self.ssl_mode}"
 
 
 @dataclass

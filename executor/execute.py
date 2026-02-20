@@ -30,6 +30,7 @@ from db.models.chat_session import ChatSession
 from llm.langchain_gemini import LangChainGeminiClient
 from llm.langchain_azure import LangChainAzureClient
 from analytics.context_builder import AnalyticsContextBuilder
+from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +248,75 @@ class ContextOrchestrator:
             memory_context=memory_context,
             available_tools=self.tool_registry.list_tools()
         )
+
+        # Step 2b: Video resolution for title-based queries
+        # GUARDRAIL: If user mentions a specific video title, resolve it
+        # BEFORE any tool execution. Never fall back to channel averages.
+        if (
+            plan.intent_classification == "video_analysis"
+            and plan.parameters.get("extracted_title")
+            and channel_uuid
+        ):
+            extracted_title = plan.parameters["extracted_title"]
+            logger.info(
+                f"[Planner] Intent detected: video_analysis — "
+                f"resolving title: \"{extracted_title}\""
+            )
+
+            resolved = resolve_video_by_title(channel_uuid, extracted_title)
+
+            # Cold-start: ONLY if videos table is empty (count == 0),
+            # proactively fetch from YouTube API and retry.
+            # NEVER triggers when DB has videos but title doesn't match.
+            if resolved is None:
+                video_count = get_video_count(channel_uuid)
+                if video_count == 0:
+                    channel_ctx = memory_context.get("channel", {})
+                    access_token = channel_ctx.get("access_token")
+                    if access_token:
+                        logger.info(
+                            "[VideoResolver] Triggering initial video sync "
+                            "(table empty)"
+                        )
+                        resolved = await self._populate_and_resolve(
+                            channel_uuid=channel_uuid,
+                            channel_ctx=channel_ctx,
+                            title_fragment=extracted_title,
+                        )
+                else:
+                    logger.info(
+                        f"[VideoResolver] Skipping sync "
+                        f"(videos already present: {video_count})"
+                    )
+
+            if resolved:
+                # Attach resolved video info for downstream tools
+                plan.parameters["resolved_video_id"] = resolved["video_id"]
+                plan.parameters["resolved_video_title"] = resolved["title"]
+                logger.info(
+                    f"[Resolver] Video resolved: {resolved['video_id']} "
+                    f"- \"{resolved['title']}\" (score: {resolved['score']})"
+                )
+            else:
+                # Return clarification response — NEVER channel averages
+                top_matches = get_top_matches(channel_uuid, extracted_title)
+                clarification_msg = self._build_clarification_message(
+                    extracted_title, top_matches
+                )
+                logger.info(
+                    f"[Resolver] No match for \"{extracted_title}\" — "
+                    f"returning clarification with {len(top_matches)} candidates"
+                )
+                return ExecuteResponse(
+                    success=True,
+                    content=clarification_msg,
+                    metadata={
+                        "intent": "video_analysis",
+                        "clarification": True,
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
 
         # Step 3: Check policy permissions
         approved_tools = self._filter_by_policy(plan, user_plan)
@@ -1479,6 +1549,118 @@ User message: {clean_message}
             response=response,
             tools_used=tools_used
         )
+
+    @staticmethod
+    def _build_clarification_message(
+        title_fragment: str,
+        top_matches: list[dict],
+    ) -> str:
+        """
+        Build a clarification response when video title cannot be resolved.
+
+        Args:
+            title_fragment: The user's original title fragment.
+            top_matches: Top N candidates from the resolver.
+
+        Returns:
+            Human-readable clarification message.
+        """
+        msg = (
+            f"I couldn't find an exact match for \"{title_fragment}\". "
+        )
+
+        if top_matches:
+            msg += "Did you mean one of these?\n\n"
+            for i, match in enumerate(top_matches, 1):
+                msg += (
+                    f"{i}. **{match['title']}** "
+                    f"(similarity: {match['score']}%)\n"
+                )
+            msg += (
+                "\nPlease reply with the exact title or number "
+                "so I can analyze the right video."
+            )
+        else:
+            msg += (
+                "I don't have any recent videos on file for your channel. "
+                "Please make sure your channel is connected and has uploaded videos."
+            )
+
+        return msg
+
+    async def _populate_and_resolve(
+        self,
+        channel_uuid: UUID,
+        channel_ctx: dict[str, Any],
+        title_fragment: str,
+    ) -> Optional[dict]:
+        """
+        Cold-start handler: fetch videos from YouTube API, upsert into DB,
+        then retry fuzzy title resolution.
+
+        Called when the resolver finds 0 videos in the DB — typically on
+        the very first title-based query before any analytics fetch has run.
+
+        Args:
+            channel_uuid: Channel UUID.
+            channel_ctx: Channel context dict with OAuth tokens.
+            title_fragment: User's title fragment.
+
+        Returns:
+            Resolved video dict or None.
+        """
+        try:
+            from registry.tool_handlers.fetch_last_video_analytics import (
+                YouTubeVideoFetcher,
+            )
+            from memory.postgres_store import postgres_store
+
+            access_token = channel_ctx.get("access_token", "")
+            refresh_token = channel_ctx.get("refresh_token")
+            user_id = channel_ctx.get("user_id")
+
+            # Need user_id — get it from the channel record
+            if not user_id:
+                channel = self.postgres_store.get_channel_by_id(channel_uuid)
+                if channel:
+                    user_id = channel.user_id
+
+            if not user_id:
+                logger.warning("[Resolver] Cannot populate: no user_id")
+                return None
+
+            user_uuid = UUID(str(user_id)) if isinstance(user_id, str) else user_id
+
+            logger.info(
+                "[Resolver] Videos table empty — fetching from YouTube API"
+            )
+
+            fetcher = YouTubeVideoFetcher(
+                access_token=access_token,
+                refresh_token=refresh_token,
+            )
+            recent_videos = fetcher.get_recent_videos(limit=20)
+
+            if not recent_videos:
+                logger.info("[Resolver] YouTube API returned 0 videos")
+                return None
+
+            result = postgres_store.upsert_videos(
+                channel_id=channel_uuid,
+                user_id=user_uuid,
+                videos_data=recent_videos,
+            )
+            logger.info(
+                f"[Resolver] Cold-start populate: {result['inserted']} inserted, "
+                f"{result['updated']} updated"
+            )
+
+            # Retry resolution with freshly populated data
+            return resolve_video_by_title(channel_uuid, title_fragment)
+
+        except Exception as e:
+            logger.warning(f"[Resolver] Cold-start populate failed: {e}")
+            return None
 
 
 # Global orchestrator instance

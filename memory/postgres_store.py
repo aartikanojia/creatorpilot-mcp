@@ -8,7 +8,8 @@ Provides persistent storage for:
 """
 
 import logging
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import desc
@@ -19,6 +20,8 @@ from db.models.analytics_snapshot import AnalyticsSnapshot
 from db.models.weekly_insight import WeeklyInsight
 from db.models.chat_session import ChatSession
 from db.models.channel import Channel
+from db.models.video_snapshot import VideoSnapshot
+from db.models.video import Video
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +190,68 @@ class PostgresMemoryStore:
         finally:
             session.close()
 
+    def get_recent_video_snapshots(
+        self, channel_id: UUID, limit: int = 50
+    ) -> list[VideoSnapshot]:
+        """
+        Retrieve recent video snapshots for a channel.
+
+        Used by the video resolver to find matching videos by title.
+
+        Args:
+            channel_id: The UUID of the channel.
+            limit: Maximum number of snapshots to return (default: 50).
+
+        Returns:
+            List of VideoSnapshot objects ordered by snapshot_date descending.
+        """
+        session = self._get_session()
+        try:
+            snapshots = (
+                session.query(VideoSnapshot)
+                .filter(VideoSnapshot.channel_id == channel_id)
+                .order_by(desc(VideoSnapshot.snapshot_date))
+                .limit(limit)
+                .all()
+            )
+            return snapshots
+        except Exception as e:
+            logger.error(f"Error fetching recent video snapshots: {e}")
+            raise
+        finally:
+            session.close()
+
+    def get_recent_videos(
+        self, channel_id: UUID, limit: int = 100
+    ) -> list[Video]:
+        """
+        Retrieve recent videos for a channel from the videos table.
+
+        Used by the video resolver for fuzzy title matching.
+
+        Args:
+            channel_id: The UUID of the channel.
+            limit: Maximum number of videos to return (default: 100).
+
+        Returns:
+            List of Video objects ordered by published_at descending.
+        """
+        session = self._get_session()
+        try:
+            videos = (
+                session.query(Video)
+                .filter(Video.channel_id == channel_id)
+                .order_by(desc(Video.published_at))
+                .limit(limit)
+                .all()
+            )
+            return videos
+        except Exception as e:
+            logger.error(f"Error fetching recent videos: {e}")
+            raise
+        finally:
+            session.close()
+
     # -------------------------------------------------------------------------
     # WRITE METHODS
     # -------------------------------------------------------------------------
@@ -258,6 +323,102 @@ class PostgresMemoryStore:
             raise
         finally:
             session.close()
+
+    def upsert_videos(
+        self,
+        channel_id: UUID,
+        user_id: UUID,
+        videos_data: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """
+        Upsert video metadata into the videos table.
+
+        Idempotent: inserts new videos and updates existing ones
+        based on (channel_id, youtube_video_id) unique constraint.
+
+        Args:
+            channel_id: Channel UUID.
+            user_id: User UUID.
+            videos_data: List of dicts from YouTube API, each with:
+                - video_id: YouTube video ID
+                - title: Video title
+                - published_at: ISO timestamp string
+                - views: View count
+                - likes: Like count
+                - comments: Comment count
+
+        Returns:
+            Dict with {"inserted": N, "updated": M}
+        """
+        session = self._get_session()
+        inserted = 0
+        updated = 0
+
+        try:
+            for vdata in videos_data:
+                yt_video_id = vdata.get("video_id", "")
+                if not yt_video_id:
+                    continue
+
+                # Check if video already exists
+                existing = (
+                    session.query(Video)
+                    .filter(
+                        Video.channel_id == channel_id,
+                        Video.youtube_video_id == yt_video_id,
+                    )
+                    .first()
+                )
+
+                # Parse published_at
+                published_at = None
+                raw_pub = vdata.get("published_at")
+                if raw_pub:
+                    try:
+                        published_at = datetime.fromisoformat(
+                            raw_pub.replace("Z", "+00:00")
+                        )
+                    except (ValueError, AttributeError):
+                        pass
+
+                if existing:
+                    # Update mutable fields
+                    existing.title = vdata.get("title", existing.title)
+                    existing.view_count = vdata.get("views", existing.view_count)
+                    existing.like_count = vdata.get("likes", existing.like_count)
+                    existing.comment_count = vdata.get("comments", existing.comment_count)
+                    if published_at:
+                        existing.published_at = published_at
+                    existing.updated_at = datetime.utcnow()
+                    updated += 1
+                else:
+                    # Insert new video
+                    video = Video(
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        youtube_video_id=yt_video_id,
+                        title=vdata.get("title", "Untitled"),
+                        published_at=published_at,
+                        view_count=vdata.get("views"),
+                        like_count=vdata.get("likes"),
+                        comment_count=vdata.get("comments"),
+                    )
+                    session.add(video)
+                    inserted += 1
+
+            session.commit()
+            logger.info(
+                f"[VideoUpsert] channel={channel_id}: "
+                f"{inserted} inserted, {updated} updated"
+            )
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error upserting videos: {e}")
+            raise
+        finally:
+            session.close()
+
+        return {"inserted": inserted, "updated": updated}
 
 
 # Global instance for convenience

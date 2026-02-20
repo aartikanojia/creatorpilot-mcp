@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 # Initialize FastAPI application
 app = FastAPI(
-    title="Context Hub MCP Server",
+    title="CreatorPilot MCP Server",
     description="Model Context Protocol server for AI agent context orchestration",
     version="1.0.0",
     lifespan=lifespan,
@@ -153,7 +153,7 @@ async def execute(request: ExecuteRequest) -> ExecuteResponse:
 async def root() -> dict[str, str]:
     """Root endpoint with API information."""
     return {
-        "service": "Context Hub MCP Server",
+        "service": "CreatorPilot MCP Server",
         "version": "1.0.0",
         "docs": "/docs" if config.server.debug else "Disabled in production"
     }
@@ -190,8 +190,8 @@ async def get_user_status(user_id: str):
 
     usage_count = 0
     try:
-        from memory.redis_store import ShortTermMemory
-        store = ShortTermMemory()
+        from memory.redis_store import RedisMemoryStore
+        store = RedisMemoryStore()
         client = await store._ensure_connection()
         raw = await client.get(usage_key)
         if raw is not None:

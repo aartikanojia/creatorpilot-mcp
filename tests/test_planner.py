@@ -655,3 +655,107 @@ class TestTopVideoDetection:
         clean, meta = orch._parse_top_video_context(raw)
         assert clean == "Analyze my top video"
         assert meta is None
+
+
+# =============================================================================
+# VIDEO RESOLUTION GUARDRAILS
+# =============================================================================
+
+class TestVideoResolutionGuardrails:
+    """
+    Tests for Phase 0.2 guardrails:
+    - Title-based queries → video_analysis intent + extracted_title
+    - Channel averages NEVER returned for video-specific queries
+    """
+
+    def test_quoted_title_detected(self, planner, available_tools, channel_context):
+        """
+        Input: 'tell me about my video "Father–Son duo in full shararat mode"'
+        Expected:
+        - video_analysis intent
+        - extracted_title populated in parameters
+        """
+        plan = planner.create_plan(
+            'tell me about my video "Father–Son duo in full shararat mode"',
+            channel_context,
+            available_tools,
+        )
+        assert plan.intent_classification == "video_analysis"
+        assert "extracted_title" in plan.parameters
+        assert "Father" in plan.parameters["extracted_title"]
+
+    def test_this_video_with_title(self, planner, available_tools, channel_context):
+        """
+        Input: "tell me about this video Father Son shararat mode"
+        Expected:
+        - video_analysis intent
+        - extracted_title contains the fragment
+        """
+        plan = planner.create_plan(
+            "tell me about this video Father Son shararat mode",
+            channel_context,
+            available_tools,
+        )
+        assert plan.intent_classification == "video_analysis"
+        assert "extracted_title" in plan.parameters
+        assert "shararat" in plan.parameters["extracted_title"].lower()
+
+    def test_my_video_with_title_fragment(self, planner, available_tools, channel_context):
+        """
+        Input: "analyze my video Valentine Day Vlog"
+        Expected:
+        - video_analysis intent
+        - extracted_title = "Valentine Day Vlog"
+        """
+        plan = planner.create_plan(
+            "analyze my video Valentine Day Vlog",
+            channel_context,
+            available_tools,
+        )
+        assert plan.intent_classification == "video_analysis"
+        assert "extracted_title" in plan.parameters
+        assert "Valentine" in plan.parameters["extracted_title"]
+
+    def test_channel_averages_never_for_video_intent(self, planner, available_tools, channel_context):
+        """
+        GUARDRAIL: When video_analysis intent is detected with a title,
+        the plan must NOT include fetch_analytics (channel averages).
+        It should only include fetch_last_video_analytics.
+        """
+        queries = [
+            'tell me about my video "Morning routine gone wrong"',
+            "tell me about this video Father Son shararat mode",
+            "analyze my video Valentine Day Vlog",
+        ]
+        for query in queries:
+            plan = planner.create_plan(query, channel_context, available_tools)
+            assert plan.intent_classification == "video_analysis", (
+                f"'{query}' should be video_analysis, got {plan.intent_classification}"
+            )
+            # fetch_analytics = channel averages. Should NOT be present.
+            assert "fetch_analytics" not in plan.tools_to_execute, (
+                f"'{query}' should NOT trigger fetch_analytics (channel averages)"
+            )
+
+    def test_extract_title_from_smart_quotes(self, planner, available_tools, channel_context):
+        """Smart (curly) quotes should also trigger title extraction."""
+        plan = planner.create_plan(
+            'tell me about my video \u201cFamily road trip\u201d',
+            channel_context,
+            available_tools,
+        )
+        assert plan.intent_classification == "video_analysis"
+        assert "extracted_title" in plan.parameters
+        assert "road trip" in plan.parameters["extracted_title"].lower()
+
+    def test_no_title_for_last_video(self, planner, available_tools, channel_context):
+        """
+        "Analyze my last video" should NOT extract a title —
+        it should use the standard fetch_last_video_analytics flow.
+        """
+        plan = planner.create_plan(
+            "Analyze my last video", channel_context, available_tools
+        )
+        assert plan.intent_classification == "video_analysis"
+        assert "extracted_title" not in plan.parameters
+

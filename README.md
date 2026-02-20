@@ -1019,9 +1019,9 @@ All configuration is via environment variables:
 | `REDIS_PASSWORD`    | -             | Redis password          |
 | `POSTGRES_HOST`     | `localhost`   | PostgreSQL host         |
 | `POSTGRES_PORT`     | `5432`        | PostgreSQL port         |
-| `POSTGRES_USER`     | `mcp`         | PostgreSQL user         |
+| `POSTGRES_USER`     | `creatorpilot_admin`         | PostgreSQL user         |
 | `POSTGRES_PASSWORD` | -             | PostgreSQL password     |
-| `POSTGRES_DB`       | `context_hub` | PostgreSQL database     |
+| `POSTGRES_DB`       | `creatorpilot` | PostgreSQL database     |
 | `LLM_PROVIDER`      | `openai`      | LLM provider name       |
 | `LLM_API_KEY`       | -             | LLM API key             |
 | `LLM_MODEL`         | `gpt-4`       | LLM model name          |
@@ -1168,6 +1168,12 @@ TOOL_REQUIREMENTS: dict[str, str] = {
 Extend the `_invoke_llm` method in `executor/execute.py` to support additional providers.
 
 ## Recent Updates
+
+### v1.3.0 — Infrastructure Hardening & Plan Enforcement
+- **Database Standardization**: Complete rename and separation to `creatorpilot` and `creatorpilot_admin`. Removal of legacy `context_hub` references.
+- **Proactive Video Ingestion**: Hardened ingestion logic to fetch strictly when `videos` table is empty, preventing unnecessary YouTube API calls.
+- **Azure Content Filter Management**: Improved error handling and resilience around OpenAI's content filtering.
+- **Plan Enforcement Engine**: Rollout of `FORCE_PRO_MODE` handling for gating FREE vs PRO execution logic.
 
 ### v1.2.0 — Intelligent Query Differentiation
 - **Content Strategy vs Growth responses**: The executor now detects query sub-types and applies the correct analysis template — content strategy queries get video concepts and hook scripts, growth queries get bottleneck diagnosis and targeted moves

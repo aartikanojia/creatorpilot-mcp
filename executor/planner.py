@@ -115,7 +115,11 @@ class ExecutionPlanner:
             r"\bnext video\s+(improve|ideas?|suggestion|tip)\b",
             r"\b(improve|better)\s+(next|my)\s+video\b",
             r"\blast upload.*(perform|analyz|review)\b",
-            r"\b(latest|last|recent|newest) video\b"
+            r"\b(latest|last|recent|newest) video\b",
+            # Title-based video queries
+            r'"[^"]+?"',                                     # quoted title
+            r"\b(this|my)\s+video\b",                        # "this video", "my video"
+            r"\b(tell me about|analyze|how.*(did|is)).*video\b",  # title fragment
         ]
     }
 
@@ -220,6 +224,13 @@ class ExecutionPlanner:
 
         # Step 7: Determine execution parameters (period, flags)
         plan.parameters = self._determine_parameters(message, intent)
+
+        # Step 8: Extract video title for title-based queries
+        if intent == "video_analysis":
+            extracted_title = self._extract_video_title(message)
+            if extracted_title:
+                plan.parameters["extracted_title"] = extracted_title
+                logger.info(f"[Planner] Extracted title: \"{extracted_title}\"")
 
         logger.info(
             f"Plan created: {len(plan.tools_to_execute)} tools selected. "
@@ -499,3 +510,51 @@ class ExecutionPlanner:
             params["fetch_library"] = True
             
         return params
+
+    def _extract_video_title(self, message: str) -> Optional[str]:
+        """
+        Extract a video title or title fragment from the user's message.
+
+        Priority:
+          1. Quoted text → exact title intent
+          2. Text after "video" keyword → title fragment
+
+        Args:
+            message: User's raw message
+
+        Returns:
+            Extracted title string, or None
+        """
+        # 1. Look for quoted text
+        quoted = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', message)
+        if quoted:
+            # Return the longest quoted segment (most likely to be a title)
+            return max(quoted, key=len).strip()
+
+        # 2. Look for text after "video" keyword
+        # Patterns: "this video <title>", "my video <title>"
+        match = re.search(
+            r'\b(?:this|my)\s+video\s+(.+)',
+            message,
+            re.IGNORECASE
+        )
+        if match:
+            fragment = match.group(1).strip()
+            # Remove trailing punctuation/question marks
+            fragment = re.sub(r'[?.!]+$', '', fragment).strip()
+            if len(fragment) > 2:  # Ignore very short fragments
+                return fragment
+
+        # 3. Look for "tell me about ... video <title>" or "analyze ... video <title>"
+        match = re.search(
+            r'\bvideo\s+(.{3,})$',
+            message,
+            re.IGNORECASE
+        )
+        if match:
+            fragment = match.group(1).strip()
+            fragment = re.sub(r'[?.!]+$', '', fragment).strip()
+            if len(fragment) > 2:
+                return fragment
+
+        return None

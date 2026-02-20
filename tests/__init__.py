@@ -1,1 +1,1 @@
-# Test package for context-hub-mcp
+# Test package for creatorpilot-mcp

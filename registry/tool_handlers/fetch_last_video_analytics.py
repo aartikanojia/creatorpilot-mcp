@@ -337,6 +337,9 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
             logger.info(f"[PRO] Fetching recent video library for channel: {channel_name}")
             recent_videos = fetcher.get_recent_videos(limit=5)
             
+            # Upsert library videos into persistent table
+            _upsert_videos_from_handler(channel_data, recent_videos)
+            
             return {
                 "message": "Video library fetched successfully",
                 "data": {
@@ -358,6 +361,16 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
         title = video["title"]
         
         logger.info(f"[PRO] Latest video resolved: {video_id} - '{title}'")
+        
+        # Upsert this video into persistent table
+        _upsert_videos_from_handler(channel_data, [{
+            "video_id": video_id,
+            "title": title,
+            "published_at": video["published_at"],
+            "views": video["views"],
+            "likes": video["likes"],
+            "comments": video["comments"],
+        }])
         
         # Step 2: Get analytics for the video
         analytics = fetcher.get_video_analytics(video_id)
@@ -404,3 +417,42 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
     except Exception as e:
         logger.exception(f"Unexpected error in fetch_last_video_analytics: {e}")
         raise RuntimeError(f"Unexpected error: {str(e)}")
+
+
+def _upsert_videos_from_handler(
+    channel_data: dict[str, Any],
+    videos_data: list[dict[str, Any]],
+) -> None:
+    """
+    Helper to upsert video data into the persistent videos table.
+
+    Non-fatal: logs warnings but never raises to avoid blocking
+    the primary handler flow.
+    """
+    if not videos_data:
+        return
+
+    try:
+        from memory.postgres_store import postgres_store
+
+        channel_id = channel_data.get("id")
+        user_id = channel_data.get("user_id")
+
+        if not channel_id or not user_id:
+            logger.warning("Missing channel_id or user_id for video upsert")
+            return
+
+        channel_uuid = UUID(channel_id) if isinstance(channel_id, str) else channel_id
+        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+
+        result = postgres_store.upsert_videos(
+            channel_id=channel_uuid,
+            user_id=user_uuid,
+            videos_data=videos_data,
+        )
+        logger.info(
+            f"[VideoSync] {result['inserted']} inserted, "
+            f"{result['updated']} updated"
+        )
+    except Exception as e:
+        logger.warning(f"Video upsert failed (non-fatal): {e}")

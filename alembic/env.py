@@ -1,5 +1,5 @@
 """Alembic environment configuration for database migrations."""
-from db.models import user, channel, analytics_snapshot, video_snapshot, weekly_insight, chat_session
+from db.models import user, channel, analytics_snapshot, video_snapshot, video, weekly_insight, chat_session
 from db.base import Base
 import logging
 import os

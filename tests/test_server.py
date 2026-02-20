@@ -105,7 +105,7 @@ class TestRootEndpoint:
         response = client.get("/")
         data = response.json()
 
-        assert data["service"] == "Context Hub MCP Server"
+        assert data["service"] == "CreatorPilot MCP Server"
         assert data["version"] == "1.0.0"
 
     def test_root_contains_docs_info(self, client):
@@ -763,3 +763,91 @@ class TestExecuteIntegration:
 
             assert data["success"] is True
             assert data["error"] is not None  # Contains partial error info
+
+
+# =============================================================================
+# User Status Endpoint Tests (FORCE_PRO_MODE Plan Enforcement)
+# =============================================================================
+
+class TestUserStatusEndpoint:
+    """Tests for /api/v1/user/status — plan enforcement via FORCE_PRO_MODE."""
+
+    @pytest.mark.asyncio
+    async def test_user_status_pro_mode(self):
+        """FORCE_PRO_MODE=true → returns plan 'pro' with no usage object."""
+        with patch("server.config") as mock_config:
+            mock_config.flags.force_pro_mode = True
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test"
+            ) as ac:
+                response = await ac.get(
+                    "/api/v1/user/status",
+                    params={"user_id": "user_123"},
+                )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["user_plan"] == "pro"
+            assert data["usage"] is None
+
+    @pytest.mark.asyncio
+    async def test_user_status_free_mode(self):
+        """FORCE_PRO_MODE=false → returns plan 'free' with usage object."""
+        with patch("server.config") as mock_config:
+            mock_config.flags.force_pro_mode = False
+
+            # Mock Redis to return usage count of 0
+            with patch("memory.redis_store.RedisMemoryStore") as mock_store_cls:
+                mock_store = MagicMock()
+                mock_client = AsyncMock()
+                mock_client.get = AsyncMock(return_value=None)
+                mock_store._ensure_connection = AsyncMock(return_value=mock_client)
+                mock_store_cls.return_value = mock_store
+
+                async with AsyncClient(
+                    transport=ASGITransport(app=app),
+                    base_url="http://test"
+                ) as ac:
+                    response = await ac.get(
+                        "/api/v1/user/status",
+                        params={"user_id": "user_123"},
+                    )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["user_plan"] == "free"
+            assert data["usage"] is not None
+            assert data["usage"]["used"] == 0
+            assert data["usage"]["limit"] == 3
+            assert data["usage"]["exhausted"] is False
+
+    @pytest.mark.asyncio
+    async def test_user_status_free_exhausted(self):
+        """FORCE_PRO_MODE=false with usage at limit → exhausted=true."""
+        with patch("server.config") as mock_config:
+            mock_config.flags.force_pro_mode = False
+
+            with patch("memory.redis_store.RedisMemoryStore") as mock_store_cls:
+                mock_store = MagicMock()
+                mock_client = AsyncMock()
+                mock_client.get = AsyncMock(return_value=b"3")
+                mock_store._ensure_connection = AsyncMock(return_value=mock_client)
+                mock_store_cls.return_value = mock_store
+
+                async with AsyncClient(
+                    transport=ASGITransport(app=app),
+                    base_url="http://test"
+                ) as ac:
+                    response = await ac.get(
+                        "/api/v1/user/status",
+                        params={"user_id": "user_123"},
+                    )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["user_plan"] == "free"
+            assert data["usage"]["used"] == 3
+            assert data["usage"]["limit"] == 3
+            assert data["usage"]["exhausted"] is True
