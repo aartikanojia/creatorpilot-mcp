@@ -1,20 +1,26 @@
 # Creator Pilot MCP Server
 
-A production-grade **Model Context Protocol (MCP)** server for AI agent context orchestration, tool execution, and memory management.
+A production-grade **Model Context Protocol (MCP)** server acting as the intelligence engine and context orchestrator for the **CreatorPilot Mobile App** (Flutter).
 
-## What is MCP?
+## What is MCP in a Mobile-First Context?
 
-The **Model Context Protocol** is an architectural pattern for building AI-powered applications that require:
+The **Model Context Protocol** is an architectural pattern for building robust AI-powered mobile experiences that require:
 
-- **Context Orchestration**: Managing conversation history, user preferences, and session state across multiple interactions
-- **Tool Execution**: Coordinating the execution of specialized tools (analytics, insights, reports) based on user intent
+- **Context Orchestration**: Managing conversation history, user preferences, and session state across multiple app sessions
+- **Tool Execution**: Coordinating specialized tools (analytics, insights, reports) entirely server-side to keep the mobile payload light
 - **Memory Management**: Combining short-term (Redis) and long-term (PostgreSQL) memory for comprehensive context
-- **Prompt Governance**: Enforcing consistent, hallucination-free responses through structured prompts
-- **LLM Agnosticism**: Supporting multiple LLM providers without code changes
+- **Prompt Governance**: Enforcing consistent, hallucination-free responses before sending payloads to mobile clients
+- **LLM Agnosticism**: Supporting multiple LLM providers without requiring app-store updates
 
 ## Architecture
 
 ```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    CreatorPilot Mobile App (Flutter)                     │
+│               (iOS / Android via single /execute endpoint)               │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                           FastAPI Server                                 │
 │                     POST /execute  |  GET /health                        │
@@ -51,16 +57,16 @@ The **Model Context Protocol** is an architectural pattern for building AI-power
 └─────────────────┘
 ```
 
-## Features
+## Mobile-First Features
 
-- **Clean HTTP API**: Single `/execute` endpoint for all context requests
-- **Extended Analytics**: CTR, impressions, retention, and traffic source metrics
-- **Availability Flags**: Graceful handling of missing metrics with explicit flags
-- **Plan-Based Access Control**: Free, Pro, and Agency tier tool restrictions
-- **Request-Based Usage Limits**: FREE users get 3 requests/day, PRO users unlimited
+- **Mobile-Optimized API**: Single `/execute` endpoint reduces network chattiness and latency for mobile clients
+- **Fail-Open Architecture**: Redis-backed state management ensures resilient mobile experiences even on spotty networks
+- **In-App Subscription Tiers**: Plan-Based Access Control (FREE/PRO/AGENCY) matches mobile app in-app purchase tiers
+- **Usage Limit Enforcement**: FREE users get 3 requests/day (tracked server-side), triggering upgrade modals on the mobile client when reached
+- **Extended Analytics**: Fast retrieval of CTR, impressions, retention, and traffic source metrics explicitly formatted for mobile charts
+- **Availability Flags**: Graceful handling of missing metrics with explicit flags to prevent mobile UI crashes
 - **Deterministic Planning**: Rule-based tool selection with explainable reasoning
-- **Memory Layers**: Redis for conversation state, PostgreSQL for historical data
-- **LLM Agnostic**: Configure any LLM provider via environment variables
+- **LLM Agnostic**: Configure any LLM provider via environment variables without requiring mobile app updates
 - **Docker Ready**: Production Dockerfile with health checks
 
 ## Usage Limits
