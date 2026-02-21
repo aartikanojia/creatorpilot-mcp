@@ -319,18 +319,9 @@ User ──┬── Channel ──┬── AnalyticsSnapshot
 ### Prerequisites
 
 - Python 3.11+
-- Docker (optional, for containerized deployment)
-- Redis (optional, falls back to in-memory)
-- PostgreSQL (optional, falls back to in-memory)
-
-> [!WARNING]
-> ### ⚠️ Development Note
-> 
-> During early development, a demo user is pre-created in the database with ID:
-> ```
-> 00000000-0000-0000-0000-000000000001
-> ```
-> This user is used to associate OAuth-connected YouTube channels until proper authentication is introduced.
+- Docker (recommended for containerized deployment)
+- Redis (required for usage limits and state management)
+- PostgreSQL (required for analytics ingestion and long-term memory)
 
 ### Local Development
 
