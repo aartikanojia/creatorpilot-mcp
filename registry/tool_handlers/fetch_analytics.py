@@ -135,7 +135,11 @@ async def handle_fetch_analytics(input_data: dict[str, Any]) -> dict[str, Any]:
             access_token=access_token,
             refresh_token=refresh_token,
         )
-        recent_videos = fetcher.get_recent_videos(limit=10)
+        recent_videos = fetcher.get_recent_videos(limit=50)
+        logger.info(
+            f"[VideoIngestion] Fetched {len(recent_videos)} videos "
+            f"from YouTube for channel {channel_name}"
+        )
         
         if recent_videos:
             # Resolve user_id from channel
@@ -149,8 +153,9 @@ async def handle_fetch_analytics(input_data: dict[str, Any]) -> dict[str, Any]:
                     videos_data=recent_videos,
                 )
                 logger.info(
-                    f"[VideoSync] {result['inserted']} inserted, "
-                    f"{result['updated']} updated during analytics fetch"
+                    f"[VideoIngestion] Inserted: {result['inserted']}, "
+                    f"Updated: {result['updated']} "
+                    f"(during analytics fetch)"
                 )
             else:
                 logger.warning("No user_id in channel context, skipping video upsert")

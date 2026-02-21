@@ -110,16 +110,17 @@ class YouTubeVideoFetcher:
         return self._analytics_service
     
     def get_recent_videos(
-        self, limit: int = 5
+        self, limit: int = 50
     ) -> list[dict[str, Any]]:
         """
         Fetch the most recently published videos for the channel.
         
+        Supports pagination to fetch beyond the first page of results.
         Returns a list of recent videos with basic metadata and stats,
         useful for content strategy analysis.
         
         Args:
-            limit: Maximum number of videos to return (default: 5).
+            limit: Maximum number of videos to return (default: 50).
             
         Returns:
             List of video dicts with id, title, published_at, views,
@@ -142,43 +143,67 @@ class YouTubeVideoFetcher:
             ["contentDetails"]["relatedPlaylists"]["uploads"]
         )
         
-        # Get recent videos from uploads playlist
-        playlist_response = service.playlistItems().list(
-            part="snippet",
-            playlistId=uploads_playlist_id,
-            maxResults=limit
-        ).execute()
+        # Paginate through uploads playlist to collect video IDs
+        all_items = []
+        next_page_token = None
         
-        items = playlist_response.get("items", [])
-        if not items:
+        while len(all_items) < limit:
+            page_size = min(50, limit - len(all_items))  # YouTube max is 50
+            request_params = {
+                "part": "snippet",
+                "playlistId": uploads_playlist_id,
+                "maxResults": page_size,
+            }
+            if next_page_token:
+                request_params["pageToken"] = next_page_token
+            
+            playlist_response = service.playlistItems().list(
+                **request_params
+            ).execute()
+            
+            page_items = playlist_response.get("items", [])
+            all_items.extend(page_items)
+            
+            next_page_token = playlist_response.get("nextPageToken")
+            if not next_page_token or not page_items:
+                break  # No more pages
+        
+        if not all_items:
             return []
+        
+        logger.info(
+            f"[VideoIngestion] Fetched {len(all_items)} video IDs "
+            f"from uploads playlist (limit={limit})"
+        )
         
         # Get video IDs
         video_ids = [
             item["snippet"]["resourceId"]["videoId"]
-            for item in items
+            for item in all_items
         ]
         
-        # Fetch full stats for all videos in one batch call
-        videos_response = service.videos().list(
-            part="snippet,statistics",
-            id=",".join(video_ids)
-        ).execute()
-        
+        # Fetch full stats — batch in groups of 50 (YouTube API limit)
         results = []
-        for video in videos_response.get("items", []):
-            snippet = video["snippet"]
-            stats = video.get("statistics", {})
-            results.append({
-                "video_id": video["id"],
-                "title": snippet.get("title", "Untitled"),
-                "published_at": snippet.get("publishedAt"),
-                "views": int(stats.get("viewCount", 0)),
-                "likes": int(stats.get("likeCount", 0)),
-                "comments": int(stats.get("commentCount", 0))
-            })
+        for i in range(0, len(video_ids), 50):
+            batch_ids = video_ids[i:i + 50]
+            videos_response = service.videos().list(
+                part="snippet,statistics",
+                id=",".join(batch_ids)
+            ).execute()
+            
+            for video in videos_response.get("items", []):
+                snippet = video["snippet"]
+                stats = video.get("statistics", {})
+                results.append({
+                    "video_id": video["id"],
+                    "title": snippet.get("title", "Untitled"),
+                    "published_at": snippet.get("publishedAt"),
+                    "views": int(stats.get("viewCount", 0)),
+                    "likes": int(stats.get("likeCount", 0)),
+                    "comments": int(stats.get("commentCount", 0))
+                })
         
-        logger.info(f"Fetched {len(results)} recent videos for content library")
+        logger.info(f"[VideoIngestion] Fetched {len(results)} videos with stats")
         return results
     
     def get_latest_video(self) -> Optional[dict[str, Any]]:
@@ -334,8 +359,11 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
         )
         
         if fetch_library:
-            logger.info(f"[PRO] Fetching recent video library for channel: {channel_name}")
-            recent_videos = fetcher.get_recent_videos(limit=5)
+            recent_videos = fetcher.get_recent_videos(limit=50)
+            logger.info(
+                f"[VideoIngestion] Fetched {len(recent_videos)} videos "
+                f"from YouTube for library"
+            )
             
             # Upsert library videos into persistent table
             _upsert_videos_from_handler(channel_data, recent_videos)
@@ -362,7 +390,22 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
         
         logger.info(f"[PRO] Latest video resolved: {video_id} - '{title}'")
         
-        # Upsert this video into persistent table
+        # Proactive ingestion: fetch and upsert last 30 videos
+        # to ensure resolver has rich metadata for future queries
+        try:
+            library_videos = fetcher.get_recent_videos(limit=50)
+            logger.info(
+                f"[VideoIngestion] Fetched {len(library_videos)} videos "
+                f"from YouTube for channel {channel_name}"
+            )
+            _upsert_videos_from_handler(channel_data, library_videos)
+        except Exception as lib_err:
+            # Non-fatal: don't block analytics if library fetch fails
+            logger.warning(
+                f"[VideoIngestion] Library fetch failed (non-fatal): {lib_err}"
+            )
+        
+        # Also upsert the current video (in case library fetch missed it)
         _upsert_videos_from_handler(channel_data, [{
             "video_id": video_id,
             "title": title,
@@ -439,7 +482,11 @@ def _upsert_videos_from_handler(
         user_id = channel_data.get("user_id")
 
         if not channel_id or not user_id:
-            logger.warning("Missing channel_id or user_id for video upsert")
+            logger.warning(
+                f"Missing channel_id or user_id for video upsert. "
+                f"channel_id={channel_id}, user_id={user_id}, "
+                f"available keys: {list(channel_data.keys())}"
+            )
             return
 
         channel_uuid = UUID(channel_id) if isinstance(channel_id, str) else channel_id
