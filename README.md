@@ -61,8 +61,9 @@ The **Model Context Protocol** is an architectural pattern for building robust A
 
 - **Mobile-Optimized API**: Single `/execute` endpoint reduces network chattiness and latency for mobile clients
 - **Fail-Open Architecture**: Redis-backed state management ensures resilient mobile experiences even on spotty networks
-- **In-App Subscription Tiers**: Plan-Based Access Control (FREE/PRO/AGENCY) matches mobile app in-app purchase tiers
-- **Usage Limit Enforcement**: FREE users get 3 requests/day (tracked server-side), triggering upgrade modals on the mobile client when reached
+- **Plan-Based Access Control**: Fully integrated FREE/PRO usage limits (3 requests/day for FREE) with server-side validation
+- **Advanced Video Diagnostics (Phase 1.1)**: Pure-Python deterministic diagnostic engine that extracts 5 structured health fields (Performance Tier, Percentile Rank, Retention Category, Momentum, Format) before invoking the LLM
+- **UX-Grade AI Responses**: Enforced strict SaaS analytics formatting (structured health overview + 2-paragraph cohesive narrative) preventing generic, hallucinated, or subjective AI advice
 - **Extended Analytics**: Fast retrieval of CTR, impressions, retention, and traffic source metrics explicitly formatted for mobile charts
 - **Availability Flags**: Graceful handling of missing metrics with explicit flags to prevent mobile UI crashes
 - **Deterministic Planning**: Rule-based tool selection with explainable reasoning

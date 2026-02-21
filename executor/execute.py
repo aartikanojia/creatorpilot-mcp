@@ -12,6 +12,7 @@ All business logic flows through here.
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple
 from uuid import UUID
@@ -30,7 +31,15 @@ from db.models.chat_session import ChatSession
 from llm.langchain_gemini import LangChainGeminiClient
 from llm.langchain_azure import LangChainAzureClient
 from analytics.context_builder import AnalyticsContextBuilder
-from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count
+from analytics.diagnostics import (
+    classify_retention,
+    compute_channel_median,
+    compute_percentile_rank,
+    detect_momentum,
+    classify_format,
+    compute_performance_tier,
+)
+from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count, get_latest_video_from_db
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +239,7 @@ class ContextOrchestrator:
                 
                 memory_context["channel"] = {
                     "id": str(channel.id),
+                    "user_id": str(channel.user_id),
                     "youtube_channel_id": channel.youtube_channel_id,
                     "channel_name": channel.channel_name,
                     "access_token": channel.access_token,
@@ -249,19 +259,129 @@ class ContextOrchestrator:
             available_tools=self.tool_registry.list_tools()
         )
 
+        # Step 2a: Relative video reference detection
+        # Handle "last video", "latest video", "my last upload" etc.
+        # by fetching the most recent video from DB directly,
+        # bypassing the fuzzy resolver entirely.
+        _RELATIVE_PATTERNS = [
+            r"\b(last|latest|recent|newest)\s+(video|upload|content)\b",
+            r"\b(my|the)\s+(last|latest|recent)\s+(video|upload)\b",
+            r"\b(my|the)\s+last\s+upload\b",
+            r"\b(previous)\s+(video|upload)\b",
+        ]
+        is_relative_ref = any(
+            re.search(p, message, re.IGNORECASE) for p in _RELATIVE_PATTERNS
+        )
+
+        if is_relative_ref and channel_uuid:
+            logger.info(
+                "[VideoResolver] Skipped — relative reference detected"
+            )
+            resolved = get_latest_video_from_db(channel_uuid, offset=0)
+            if resolved:
+                plan.parameters["resolved_video_id"] = resolved["video_id"]
+                plan.parameters["resolved_video_title"] = resolved["title"]
+                plan.parameters["video_resolution"] = resolved["video_resolution"]
+                plan.parameters["reference_type"] = "relative"
+
+                # Ensure intent is video_analysis so correct tools run
+                if plan.intent_classification != "video_analysis":
+                    logger.info(
+                        f"[Resolver] Upgrading intent from "
+                        f"'{plan.intent_classification}' → 'video_analysis' "
+                        f"(relative reference)"
+                    )
+                    plan.intent_classification = "video_analysis"
+                    plan.tools_to_execute = []
+                    plan.reasoning = {}
+                    available = self.tool_registry.list_tools()
+                    for t in ["fetch_last_video_analytics", "recall_context"]:
+                        if t in available:
+                            plan.add_tool(t, "Selected for video_analysis (relative reference)")
+
+                logger.info(
+                    f"[Resolver] Relative video resolved: {resolved['video_id']} "
+                    f"- \"{resolved['title']}\""
+                )
+            else:
+                # No videos in DB at all
+                logger.info(
+                    "[Resolver] Relative reference but no videos in DB"
+                )
+                return ExecuteResponse(
+                    success=True,
+                    content="No videos found for your channel yet. "
+                            "Please make sure your channel is connected and "
+                            "has at least one uploaded video.",
+                    metadata={
+                        "intent": "video_analysis",
+                        "clarification": True,
+                        "reference_type": "relative",
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
+
         # Step 2b: Video resolution for title-based queries
+        # SKIP if Step 2a (relative reference) already resolved a video.
         # GUARDRAIL: If user mentions a specific video title, resolve it
         # BEFORE any tool execution. Never fall back to channel averages.
-        if (
-            plan.intent_classification == "video_analysis"
-            and plan.parameters.get("extracted_title")
-            and channel_uuid
-        ):
+        #
+        # Three entry paths:
+        #   A) Planner says video_analysis + extracted_title  → use title
+        #   B) Planner says video_analysis but no title       → use full message
+        #   C) Planner says other intent but message has video keywords
+        #      → proactive fallback to catch misclassified title queries
+        extracted_title = None
+        is_video_intent = plan.intent_classification == "video_analysis"
+        already_resolved = plan.parameters.get("reference_type") == "relative"
+
+        if not already_resolved and is_video_intent and plan.parameters.get("extracted_title"):
+            # Path A: planner extracted a title
             extracted_title = plan.parameters["extracted_title"]
-            logger.info(
-                f"[Planner] Intent detected: video_analysis — "
-                f"resolving title: \"{extracted_title}\""
+        elif not already_resolved and is_video_intent and not plan.parameters.get("extracted_title"):
+            # Path B: video_analysis but no title — use cleaned message
+            # Strip common preambles to get the title fragment
+            cleaned = re.sub(
+                r"^(please\s+)?(tell me about|analyze|how did|how is|what about)\s+",
+                "", message, flags=re.IGNORECASE,
+            ).strip()
+            cleaned = re.sub(r"\s*\?\s*$", "", cleaned).strip()
+            if len(cleaned) > 3:
+                extracted_title = cleaned
+                logger.info(
+                    f"[Resolver] No extracted_title from planner — "
+                    f"using cleaned message: \"{extracted_title}\""
+                )
+        elif (
+            not already_resolved
+            and not is_video_intent
+            and channel_uuid
+            and re.search(
+                r"\b(tell me about|analyze|how did|how is)\b",
+                message, re.IGNORECASE,
             )
+        ):
+            # Path C: planner misclassified, but message looks like
+            # a title-based query. Try proactive resolution.
+            cleaned = re.sub(
+                r"^(please\s+)?(tell me about|analyze|how did|how is|what about)\s+",
+                "", message, flags=re.IGNORECASE,
+            ).strip()
+            cleaned = re.sub(r"\s*\?\s*$", "", cleaned).strip()
+            if len(cleaned) > 5:
+                extracted_title = cleaned
+                logger.info(
+                    f"[Resolver] Proactive fallback — intent was "
+                    f"'{plan.intent_classification}', attempting resolution "
+                    f"with: \"{extracted_title}\""
+                )
+
+        if extracted_title and channel_uuid:
+            logger.info(
+                f"[Resolver] Resolving title: \"{extracted_title}\""
+            )
+            plan.parameters["extracted_title"] = extracted_title
 
             resolved = resolve_video_by_title(channel_uuid, extracted_title)
 
@@ -289,16 +409,60 @@ class ContextOrchestrator:
                         f"(videos already present: {video_count})"
                     )
 
-            if resolved:
-                # Attach resolved video info for downstream tools
+            # Handle resolver response (accepted / ambiguous / rejected / None)
+            if resolved and resolved.get("clarification"):
+                # Ambiguous or rejected — return clarification to user
+                clarification_msg = resolved.get("message", "")
+                candidates = resolved.get("candidates", [])
+                resolution_meta = resolved.get("video_resolution", {})
+                logger.info(
+                    f"[Resolver] {resolution_meta.get('decision', 'unknown')} "
+                    f"for \"{extracted_title}\" — "
+                    f"returning clarification with {len(candidates)} candidates"
+                )
+                return ExecuteResponse(
+                    success=True,
+                    content=clarification_msg,
+                    metadata={
+                        "intent": "video_analysis",
+                        "clarification": True,
+                        "video_resolution": resolution_meta,
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
+            elif resolved and not resolved.get("clarification"):
+                # Accepted match — attach resolved video info for tools
                 plan.parameters["resolved_video_id"] = resolved["video_id"]
                 plan.parameters["resolved_video_title"] = resolved["title"]
+                resolution_meta = resolved.get("video_resolution", {})
+                plan.parameters["video_resolution"] = resolution_meta
+
+                # If planner misclassified, upgrade intent to video_analysis
+                # so the correct tools (fetch_last_video_analytics) run.
+                if plan.intent_classification != "video_analysis":
+                    logger.info(
+                        f"[Resolver] Upgrading intent from "
+                        f"'{plan.intent_classification}' → 'video_analysis' "
+                        f"(proactive resolution succeeded)"
+                    )
+                    plan.intent_classification = "video_analysis"
+                    plan.tools_to_execute = []
+                    plan.reasoning = {}
+                    # Re-select tools for video_analysis intent
+                    video_tools = ["fetch_last_video_analytics", "recall_context"]
+                    available = self.tool_registry.list_tools()
+                    for t in video_tools:
+                        if t in available:
+                            plan.add_tool(t, f"Re-selected for video_analysis after proactive resolution")
+
                 logger.info(
                     f"[Resolver] Video resolved: {resolved['video_id']} "
-                    f"- \"{resolved['title']}\" (score: {resolved['score']})"
+                    f"- \"{resolved['title']}\" (score: {resolved['score']}, "
+                    f"decision: {resolution_meta.get('decision', 'N/A')})"
                 )
             else:
-                # Return clarification response — NEVER channel averages
+                # None — no videos in DB at all
                 top_matches = get_top_matches(channel_uuid, extracted_title)
                 clarification_msg = self._build_clarification_message(
                     extracted_title, top_matches
@@ -326,6 +490,63 @@ class ContextOrchestrator:
             approved_tools = []
             tool_results = []
             logger.info("Account intent — skipping all tool execution")
+
+        # HARD GUARDRAIL: video_analysis intent MUST have a resolved video.
+        # If no video was resolved (no extracted_title, no channel_uuid,
+        # or resolver returned ambiguous/rejected), block ALL tool execution
+        # and LLM reasoning. Never fall back to channel averages.
+        if (
+            plan.intent_classification == "video_analysis"
+            and not plan.parameters.get("resolved_video_id")
+        ):
+            logger.warning(
+                "[VideoGuard] video_analysis intent but no resolved video — "
+                "blocking all tools and LLM to prevent channel-average fallback"
+            )
+            return ExecuteResponse(
+                success=True,
+                content=(
+                    "I couldn't find a specific video matching that title. "
+                    "Please try with the exact video title or a longer portion "
+                    "of it so I can analyze the right video."
+                ),
+                metadata={
+                    "intent": "video_analysis",
+                    "clarification": True,
+                    "video_guard": "no_resolved_video",
+                    "user_plan": user_plan,
+                    "usage": usage_metadata,
+                }
+            )
+
+        # HARD GUARDRAIL: compare_videos intent MUST have at least 2 resolved video_ids.
+        # If fewer than 2, block tools and ask for clarification — never guess.
+        if plan.intent_classification == "compare_videos":
+            resolved_ids = plan.parameters.get("resolved_video_ids", [])
+            if not isinstance(resolved_ids, list):
+                resolved_ids = []
+            if len(resolved_ids) < 2:
+                logger.warning(
+                    "[VideoGuard] compare_videos intent but only "
+                    f"{len(resolved_ids)} resolved video_id(s) — "
+                    "blocking tools, returning clarification"
+                )
+                return ExecuteResponse(
+                    success=True,
+                    content=(
+                        "To compare videos, I need you to name both videos. "
+                        "Please provide the titles of the two videos you'd "
+                        "like me to compare."
+                    ),
+                    metadata={
+                        "intent": "compare_videos",
+                        "clarification": True,
+                        "video_guard": "insufficient_resolved_videos",
+                        "resolved_count": len(resolved_ids),
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
 
         # Step 4: Execute approved tools
         if approved_tools:
@@ -771,7 +992,7 @@ class ContextOrchestrator:
         analysis_prompt = self._load_prompt("analysis")
 
         # HARD GUARDRAIL: Only build analytics context for analytics intents
-        analytics_intents = {"analytics", "video_analysis", "insight", "report"}
+        analytics_intents = {"analytics", "video_analysis", "insight", "report", "compare_videos"}
         # Broader set: intents that need channel data context (e.g. subscriber count)
         context_intents = analytics_intents | {"account"}
         
@@ -869,6 +1090,20 @@ class ContextOrchestrator:
         # Build video analytics section from tool results
         video_analytics_section = self._build_video_analytics_prompt_section(tool_results)
 
+        # Build video library section from DB — always inject regardless of intent
+        # This allows ANY query (including general/account) to answer
+        # ranking/comparison questions like "most watched video"
+        video_library_section = self._build_video_library_from_db(channel_uuid)
+
+        # Build deterministic diagnostics for video_analysis intent
+        diagnostics_section = ""
+        if plan.intent_classification == "video_analysis" and channel_uuid:
+            diagnostics_section = self._build_diagnostics_section(
+                analytics_context=analytics_context,
+                tool_results=tool_results,
+                channel_uuid=channel_uuid,
+            )
+
         # Parse and strip [TOP_VIDEO_CONTEXT] metadata from message
         clean_message, top_video_meta = self._parse_top_video_context(message)
         is_top_video = self._is_top_video_query(clean_message)
@@ -936,7 +1171,72 @@ User message: {clean_message}
             )
 
             if plan.intent_classification in analytics_intents:
-                if is_content_strategy:
+                if plan.intent_classification == "compare_videos":
+                    instructions_block = """Instructions:
+- The user wants to COMPARE two videos side-by-side.
+- Use ONLY the data from the VIDEO LIBRARY section for both videos.
+- Compare the two videos on: views, likes, comments, engagement (likes+comments/views), and published date.
+- State clearly which video performed better on each metric.
+- Give ONE actionable insight: what made the better-performing video work, and how to apply it to future content.
+- Do NOT reference channel-wide averages, subscriber totals, or other videos not named.
+- Do NOT suggest comparing more than the 2 requested videos.
+- No markdown tables. No raw JSON. No emoji.
+- Tone: data-driven advisor comparing two experiments."""
+                elif plan.intent_classification == "video_analysis":
+                    instructions_block = """You are a Video Performance Diagnostic Engine.
+Your output MUST follow this EXACT structure with no deviations.
+
+---
+
+**Video Health Overview**
+
+- Performance Tier: <copy exact value from VIDEO DIAGNOSTICS>
+- Percentile Rank: <copy exact percentile text from VIDEO DIAGNOSTICS — do NOT rephrase or invert>
+- Retention Category: <copy exact value from VIDEO DIAGNOSTICS>
+- Momentum Status: <copy exact value from VIDEO DIAGNOSTICS>
+- Format Type: <copy exact value from VIDEO DIAGNOSTICS>
+
+**Diagnostic Interpretation**
+
+Exactly 2 paragraphs. No more.
+
+Paragraph 1 — Performance position (2–3 sentences):
+Synthesize Performance Tier + Percentile Rank. Explain where this video sits relative to the channel's content library. Reference the percentile value naturally without repeating the label.
+
+Paragraph 2 — Engagement and distribution (2–3 sentences):
+Synthesize Retention Category + Momentum Status + Format Type. Explain what the retention pattern and momentum signal about algorithmic distribution, factoring in format expectations.
+
+[TONE — MANDATORY]
+- Use neutral, product-grade vocabulary ONLY: "indicates", "suggests", "signals", "reflects", "positions the video"
+- Do NOT use emotional or dramatic language: "significant disconnect", "risks being overlooked", "challenging landscape", "critical", "compounds the issue", "unfortunately", "struggles"
+- Do NOT use subjective adjectives: "impressive", "concerning", "disappointing", "remarkable"
+- Do NOT repeat the percentile explanation more than once
+- Max 8–10 total sentences across both paragraphs
+- Tone: SaaS analytics product — clean, neutral, factual
+
+[STRICT RULES]
+- Use the EXACT bold headings: **Video Health Overview** and **Diagnostic Interpretation**. No other headings.
+- Always include ALL five diagnostic fields in the exact order shown.
+- Copy diagnostic values WORD FOR WORD from the VIDEO DIAGNOSTICS section.
+- Do NOT invert percentile values. If diagnostics say "outperformed 0%", write "outperformed 0%" — NEVER restate as "top 100%".
+- Do NOT recompute any fields from raw numbers.
+- If a field is Unknown, state it is unavailable — do NOT infer or estimate.
+- No emoji. No markdown tables. No raw JSON.
+- No summary paragraph. No closing question. No call-to-action.
+- End after the second paragraph. Do NOT add anything after it.
+
+[STRICTLY FORBIDDEN]
+You MUST NOT:
+- Suggest titles, thumbnails, or hook scripts
+- Offer strategic fixes or content changes
+- Recommend improvements or future targets
+- Propose next video ideas or growth strategies
+- Provide content strategy or creative direction
+- Ask follow-up questions (e.g. "Would you like...")
+- Add motivational language or encouragement
+- Use phrases: "next video", "you should", "consider doing", "to improve", "I recommend"
+- Add any sections beyond **Video Health Overview** and **Diagnostic Interpretation**"""
+                elif is_content_strategy:
                     instructions_block = """Instructions:
 - The user is asking a CONTENT STRATEGY question — "What should I upload next?"
 - Follow the CONTENT STRATEGY TEMPLATE from the analysis prompt.
@@ -974,24 +1274,23 @@ User message: {clean_message}
 - Each recommendation must pass: "Is this specific to THIS channel's data, or could it apply to anyone?"
 - Do NOT use generic phrases like "improve thumbnails" or "engage your audience."
 - No markdown tables. No raw JSON. No emoji.
-- Tone: strategic growth advisor reviewing a performance dashboard.
-
-When analyzing a specific video (if LAST VIDEO ANALYTICS data is present):
-- Follow the Video Analysis Template from the analysis prompt.
-- Focus on the ONE metric that tells the story — do not list all metrics.
-- Identify the replication pattern: what structural element should the next video copy?
-- Include concrete examples: rewritten titles, hook scripts, thumbnail descriptions.
-- Do NOT repeat the same metric in multiple sections."""
+- Tone: strategic growth advisor reviewing a performance dashboard."""
             else:
                 instructions_block = """Instructions:
-- This is a conversational or account query — NOT a deep analytics request.
-- Answer the user's question directly using the Context and analytics data provided.
-- If the user asks about subscribers, views, or basic stats, quote the exact number from the analytics data.
-- Use the channel name and profile information from the Context section.
+- Answer the user's question directly and confidently.
+- If the user asks about video performance (most watched, most liked, best performing, recent videos), ALWAYS use the VIDEO LIBRARY section above — it contains title, date, views, likes, and comments for all stored videos.
+- To answer "most watched in last X days": look at the VIDEO LIBRARY, filter by published date, and rank by views. State the answer directly.
+- If the user asks about subscribers, views, or basic channel stats, quote the exact number from the analytics data.
+- Do NOT say you don't have the data if it appears in VIDEO LIBRARY or Context.
 - Do NOT provide a full analytics diagnosis or bottleneck analysis.
 - Do NOT mention tools or data sources.
-- Keep the response short, friendly, and helpful.
-- Do NOT use emoji."""
+- Keep the response short, friendly, and direct.
+- Do NOT use emoji.
+
+[SCOPE ISOLATION — CHANNEL SUMMARY]
+Forbidden in channel-level responses:
+- Do NOT include per-video analytics (engagement rate, avg watch time per video, or likes per video) unless the user explicitly asked about a specific video.
+- Do NOT reference individual video IDs or specific video performance metrics in a channel summary."""
 
             full_prompt = f"""
 {system_prompt}
@@ -1001,6 +1300,10 @@ When analyzing a specific video (if LAST VIDEO ANALYTICS data is present):
 {analytics_section}
 
 {video_analytics_section}
+
+{diagnostics_section}
+
+{video_library_section}
 
 Context:
 {full_context}
@@ -1300,6 +1603,177 @@ User message: {clean_message}
         lines.append(f"- Comments: {comments:,}")
 
         return "\n".join(lines)
+
+    def _build_video_library_from_db(
+        self,
+        channel_uuid: Optional[UUID],
+    ) -> str:
+        """
+        Build a video library context section from the DB videos table.
+
+        Returns a formatted string listing all stored videos with their
+        metrics (views, likes, comments, published_at) so the LLM can
+        answer ranking/comparison queries like "most watched video".
+
+        Args:
+            channel_uuid: Channel UUID to query videos for.
+
+        Returns:
+            Formatted video library section, or empty string.
+        """
+        if not channel_uuid:
+            return ""
+
+        try:
+            videos = self.postgres_store.get_recent_videos(
+                channel_uuid, limit=50
+            )
+            if not videos:
+                return ""
+
+            lines = [
+                "## VIDEO LIBRARY (from DB — use for ranking/comparison queries)",
+                f"Total videos stored: {len(videos)}",
+                "",
+            ]
+            for i, v in enumerate(videos, 1):
+                pub = str(v.published_at)[:10] if v.published_at else "N/A"
+                views = v.view_count or 0
+                likes = v.like_count or 0
+                comments = v.comment_count or 0
+                lines.append(
+                    f"{i}. \"{v.title}\" ({pub}) — "
+                    f"{views:,} views, {likes:,} likes, "
+                    f"{comments:,} comments"
+                )
+
+            logger.debug(
+                f"[VideoLibrary] Injected {len(videos)} videos into LLM context"
+            )
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"Failed to build video library context: {e}")
+            return ""
+
+    def _build_diagnostics_section(
+        self,
+        analytics_context: dict,
+        tool_results: list,
+        channel_uuid,
+    ) -> str:
+        """
+        Compute deterministic diagnostic labels for a video_analysis prompt.
+
+        Extracts available metrics from analytics_context and tool results,
+        runs all diagnostic functions, and formats output as a structured
+        block for the LLM to use directly without recalculation.
+
+        Returns:
+            Formatted diagnostics section string, or empty string on failure.
+        """
+        try:
+            # --- Collect inputs ---
+            current = analytics_context.get("current_period") or {}
+            avg_view_pct = current.get("avg_view_percentage")
+            traffic_sources = current.get("traffic_sources")
+
+            # Pull video-specific fields from tool result
+            video_views = None
+            duration_seconds = None
+            last_7_views = None
+            prev_28_views = None
+
+            for result in tool_results:
+                if result.tool_name == "fetch_last_video_analytics" and result.success:
+                    data = (result.output or {}).get("data", {})
+                    if data and "library" not in data:
+                        video_views = data.get("views")
+                        # duration comes from DB; try to pull from tool output
+                        duration_seconds = data.get("duration_seconds")
+                        last_7_views = data.get("views")  # best proxy available
+                    break
+
+            # Channel video library for median / percentile
+            channel_videos = []
+            channel_view_counts = []
+            try:
+                channel_videos = self.postgres_store.get_recent_videos(
+                    channel_uuid, limit=30
+                )
+                channel_view_counts = [
+                    v.view_count for v in channel_videos
+                    if v.view_count is not None
+                ]
+                # Pull duration_seconds from DB if not in tool result
+                if duration_seconds is None and video_views is not None:
+                    for v in channel_videos:
+                        if v.view_count == video_views:
+                            duration_seconds = v.duration_seconds
+                            break
+            except Exception as e:
+                logger.warning(f"[Diagnostics] Could not load channel videos: {e}")
+
+            # channel median
+            median = compute_channel_median(channel_videos)
+            median_views = median["median_views"]
+
+            # Previous-28-day baseline: use median_views * 4 as proxy
+            # (each of last 30 videos represents ~1 week of content)
+            prev_28_estimate = (
+                median_views * 4 if median_views else None
+            )
+
+            # --- Run diagnostics ---
+            retention_category = classify_retention(avg_view_pct)
+            percentile_rank = compute_percentile_rank(
+                video_views or 0, channel_view_counts
+            ) if channel_view_counts and video_views is not None else None
+            performance_tier = compute_performance_tier(
+                percentile_rank, retention_category
+            )
+            momentum_status = detect_momentum(last_7_views, prev_28_estimate)
+            format_type = classify_format(duration_seconds, traffic_sources)
+
+            # --- Format section ---
+            lines = ["## VIDEO DIAGNOSTICS (pre-computed — COPY THESE VALUES EXACTLY, do not recalculate or rephrase)"]
+            lines.append(f"- Performance Tier: {performance_tier}")
+            lines.append(f"- Retention Category: {retention_category}"
+                         + (f" ({avg_view_pct:.1f}% avg view)" if avg_view_pct is not None else ""))
+            lines.append(f"- Momentum Status: {momentum_status}")
+            lines.append(f"- Format Type: {format_type}")
+            if percentile_rank is not None:
+                # Include explicit human interpretation — prevent LLM inversion
+                if percentile_rank >= 75:
+                    rank_interpretation = "ABOVE most channel videos"
+                elif percentile_rank >= 50:
+                    rank_interpretation = "above the channel median"
+                elif percentile_rank >= 25:
+                    rank_interpretation = "below the channel median"
+                else:
+                    rank_interpretation = "BELOW most channel videos"
+                lines.append(
+                    f"- Percentile Rank: {percentile_rank:.0f}th percentile — "
+                    f"this video outperformed {percentile_rank:.0f}% of channel videos "
+                    f"({rank_interpretation})"
+                )
+            else:
+                lines.append("- Percentile Rank: Unknown (insufficient channel data)")
+            if median_views:
+                lines.append(f"- Channel Median Views: {median_views:,}")
+
+            logger.debug(
+                f"[Diagnostics] tier={performance_tier}, retention={retention_category}, "
+                f"momentum={momentum_status}, format={format_type}, "
+                f"percentile={percentile_rank}"
+            )
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"[Diagnostics] Failed to build section: {e}")
+            return ""
+
+
 
     async def _invoke_llm(self, prompt: str) -> str:
         """
