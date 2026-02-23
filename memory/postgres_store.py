@@ -387,6 +387,9 @@ class PostgresMemoryStore:
                     existing.view_count = vdata.get("views", existing.view_count)
                     existing.like_count = vdata.get("likes", existing.like_count)
                     existing.comment_count = vdata.get("comments", existing.comment_count)
+                    duration = vdata.get("duration_seconds")
+                    if duration:
+                        existing.duration_seconds = duration
                     if published_at:
                         existing.published_at = published_at
                     existing.updated_at = datetime.utcnow()
@@ -402,6 +405,7 @@ class PostgresMemoryStore:
                         view_count=vdata.get("views"),
                         like_count=vdata.get("likes"),
                         comment_count=vdata.get("comments"),
+                        duration_seconds=vdata.get("duration_seconds"),
                     )
                     session.add(video)
                     inserted += 1

@@ -39,6 +39,13 @@ from analytics.diagnostics import (
     classify_format,
     compute_performance_tier,
 )
+from analytics.strategy import compute_strategy_framework
+from analytics.patterns import (
+    cluster_by_keyword,
+    detect_top_theme,
+    detect_underperforming_theme,
+    detect_format_bias,
+)
 from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count, get_latest_video_from_db
 
 logger = logging.getLogger(__name__)
@@ -993,8 +1000,8 @@ class ContextOrchestrator:
 
         # HARD GUARDRAIL: Only build analytics context for analytics intents
         analytics_intents = {"analytics", "video_analysis", "insight", "report", "compare_videos"}
-        # Broader set: intents that need channel data context (e.g. subscriber count)
-        context_intents = analytics_intents | {"account"}
+        # Broader set: intents that need channel data context (e.g. subscriber count, video library)
+        context_intents = analytics_intents | {"account", "pattern_analysis"}
         
         if plan.intent_classification in context_intents:
             analytics_context = self.analytics_builder.build_analytics_context(
@@ -1013,8 +1020,10 @@ class ContextOrchestrator:
         context_parts = []
 
         # Add conversation history (short-term from Redis)
+        # SKIP for pattern_analysis — old conversation contains stale pattern responses
+        # that the LLM would copy instead of using the fresh pre-computed pattern data
         history = memory_context.get("conversation_history", [])
-        if history:
+        if history and plan.intent_classification != "pattern_analysis":
             context_parts.append("Recent conversation:")
             for msg in history[-5:]:  # Last 5 messages
                 context_parts.append(
@@ -1059,15 +1068,18 @@ class ContextOrchestrator:
                     context_parts.append(f"  Wins: {wins_str}")
 
         # Add recent chat history from PostgreSQL
+        # SKIP for pattern_analysis — old chat history contains stale pattern responses
+        # that contaminate the LLM output
         recent_chats = historical.get("recent_chats", [])
-        if recent_chats:
+        if recent_chats and plan.intent_classification != "pattern_analysis":
             context_parts.append("\nPrevious conversations:")
             for chat in recent_chats[:3]:  # Limit to 3 for context
                 user_msg = chat.get("user_message", "")[:100]  # Truncate
                 context_parts.append(f"- User: {user_msg}...")
 
         # Add tool results
-        if tool_results:
+        # SKIP for pattern_analysis — pattern engine uses pre-computed data only
+        if tool_results and plan.intent_classification != "pattern_analysis":
             context_parts.append("\nTool execution results:")
             for result in tool_results:
                 if result.success:
@@ -1090,10 +1102,13 @@ class ContextOrchestrator:
         # Build video analytics section from tool results
         video_analytics_section = self._build_video_analytics_prompt_section(tool_results)
 
-        # Build video library section from DB — always inject regardless of intent
-        # This allows ANY query (including general/account) to answer
-        # ranking/comparison questions like "most watched video"
-        video_library_section = self._build_video_library_from_db(channel_uuid)
+        # Build video library section from DB — inject for all intents EXCEPT pattern_analysis
+        # pattern_analysis uses its own pre-computed pattern_section (filtered tokens)
+        # Injecting raw titles would cause the LLM to ignore pre-computed data
+        if plan.intent_classification != "pattern_analysis":
+            video_library_section = self._build_video_library_from_db(channel_uuid)
+        else:
+            video_library_section = ""
 
         # Build deterministic diagnostics for video_analysis intent
         diagnostics_section = ""
@@ -1103,6 +1118,19 @@ class ContextOrchestrator:
                 tool_results=tool_results,
                 channel_uuid=channel_uuid,
             )
+
+        # Build pattern intelligence for pattern_analysis intent
+        pattern_section = ""
+        if plan.intent_classification == "pattern_analysis" and channel_uuid:
+            logger.info("[PatternRoute] Building pattern section for pattern_analysis intent")
+            pattern_section = self._build_pattern_section(
+                channel_uuid=channel_uuid,
+            )
+            logger.info(f"[PatternRoute] Pattern section length: {len(pattern_section)} chars")
+            if pattern_section:
+                logger.info(f"[PatternRoute] Preview: {pattern_section[:200]}")
+        else:
+            logger.info(f"[PatternRoute] Skipped — intent={plan.intent_classification}, channel_uuid={channel_uuid}")
 
         # Parse and strip [TOP_VIDEO_CONTEXT] metadata from message
         clean_message, top_video_meta = self._parse_top_video_context(message)
@@ -1155,6 +1183,11 @@ User message: {clean_message}
                 clean_message, plan.intent_classification
             )
 
+            # Detect pattern intelligence queries
+            is_pattern_query = self._is_pattern_query(
+                clean_message, plan.intent_classification
+            )
+
             # Build analysis section — include full template for content strategy queries
             analysis_section_prompt = ""
             if analysis_prompt:
@@ -1170,7 +1203,48 @@ User message: {clean_message}
                 clean_message, plan.intent_classification
             )
 
-            if plan.intent_classification in analytics_intents:
+            if plan.intent_classification == "pattern_analysis":
+                instructions_block = """You are the Pattern Intelligence Engine.
+
+STRICT RULES:
+- DO NOT generate strategy
+- DO NOT generate video ideas
+- DO NOT generate hook scripts
+- DO NOT generate thumbnail advice
+- DO NOT generate success metrics
+- DO NOT suggest what to scale
+- DO NOT suggest what to improve
+- DO NOT give growth recommendations
+
+Only return:
+1. Top Performing Theme (by median views)
+2. Underperforming Theme
+3. Format Bias (Shorts vs Standard)
+4. Retention Bias (if applicable)
+
+Output format:
+
+**Pattern Intelligence**
+
+Top Performing Theme: <copy from PATTERN INTELLIGENCE>
+Median Views: <copy from PATTERN INTELLIGENCE>
+
+Underperforming Theme: <copy from PATTERN INTELLIGENCE>
+Median Views: <copy from PATTERN INTELLIGENCE>
+
+Format Bias:
+Shorts Median Views: <copy from PATTERN INTELLIGENCE>
+Standard Median Views: <copy from PATTERN INTELLIGENCE>
+
+Keep response analytical and neutral.
+No paragraphs.
+No advice.
+No emoji.
+No markdown tables.
+No raw JSON.
+No summary paragraph. No closing question. No call-to-action.
+End after the Pattern Intelligence section. Do NOT add anything after it."""
+            elif plan.intent_classification in analytics_intents:
                 if plan.intent_classification == "compare_videos":
                     instructions_block = """Instructions:
 - The user wants to COMPARE two videos side-by-side.
@@ -1182,8 +1256,45 @@ User message: {clean_message}
 - Do NOT suggest comparing more than the 2 requested videos.
 - No markdown tables. No raw JSON. No emoji.
 - Tone: data-driven advisor comparing two experiments."""
+                elif is_pattern_query and plan.intent_classification in ("video_analysis", "channel_analysis", "general_analytics"):
+                    instructions_block = """You are a Pattern Intelligence Engine.
+Your output MUST follow this EXACT structure with no deviations.
+
+---
+
+**Pattern Intelligence**
+
+Top Performing Theme: <copy from PATTERN INTELLIGENCE>
+Median Views: <copy from PATTERN INTELLIGENCE>
+
+Underperforming Theme: <copy from PATTERN INTELLIGENCE>
+Median Views: <copy from PATTERN INTELLIGENCE>
+
+Format Bias:
+Shorts Median Views: <copy from PATTERN INTELLIGENCE>
+Standard Median Views: <copy from PATTERN INTELLIGENCE>
+
+[PATTERN INTELLIGENCE — STRICT RULES]
+- You MUST use Pattern Intelligence section exactly as provided.
+- You are NOT allowed to invent themes.
+- Do NOT provide emotional reasoning.
+- Do NOT give content ideas unless explicitly requested.
+- Do NOT add Diagnostics or Strategy sections.
+- Do NOT recompute themes or format biases.
+- Do NOT use emojis.
+- Keep professional tone.
+- Keep concise.
+- No summary paragraph. No closing question. No call-to-action.
+- End after the Pattern Intelligence section. Do NOT add anything after it.
+
+[STRICTLY FORBIDDEN]
+You MUST NOT:
+- Hallucinate themes or format biases not in the data
+- Add motivational language or encouragement
+- Use phrases: "you should", "consider doing", "to improve", "I recommend"
+- Add any sections beyond Pattern Intelligence"""
                 elif plan.intent_classification == "video_analysis":
-                    instructions_block = """You are a Video Performance Diagnostic Engine.
+                    instructions_block = """You are a Video Performance Diagnostic and Strategy Engine.
 Your output MUST follow this EXACT structure with no deviations.
 
 ---
@@ -1206,36 +1317,67 @@ Synthesize Performance Tier + Percentile Rank. Explain where this video sits rel
 Paragraph 2 — Engagement and distribution (2–3 sentences):
 Synthesize Retention Category + Momentum Status + Format Type. Explain what the retention pattern and momentum signal about algorithmic distribution, factoring in format expectations.
 
+**Strategic Direction**
+
+Strategy Mode: <copy exact value from STRATEGY FRAMEWORK>
+Risk Level: <copy exact value from STRATEGY FRAMEWORK>
+Primary Focus: <copy exact value from STRATEGY FRAMEWORK>
+Secondary Focus: <copy exact value from STRATEGY FRAMEWORK>
+
+Copy all four values exactly as provided. Do NOT reinterpret, recompute, or add additional focus areas. Do NOT prepend hyphens or bullets.
+
+**High-Impact Actions**
+
+List the Recommended Actions from the STRATEGY FRAMEWORK section as a numbered list. Copy them exactly — do NOT rephrase, add, or remove any.
+
+**Execution Pattern**
+
+Copy the Execution Pattern text from the STRATEGY FRAMEWORK section as a single paragraph. Do NOT modify it.
+
+**Pattern Intelligence**
+
+Top Performing Theme: <copy from PATTERN INTELLIGENCE>
+Underperforming Theme: <copy from PATTERN INTELLIGENCE>
+
+Format Bias:
+Shorts Median Views: <copy from PATTERN INTELLIGENCE>
+Standard Median Views: <copy from PATTERN INTELLIGENCE>
+
 [TONE — MANDATORY]
 - Use neutral, product-grade vocabulary ONLY: "indicates", "suggests", "signals", "reflects", "positions the video"
 - Do NOT use emotional or dramatic language: "significant disconnect", "risks being overlooked", "challenging landscape", "critical", "compounds the issue", "unfortunately", "struggles"
 - Do NOT use subjective adjectives: "impressive", "concerning", "disappointing", "remarkable"
 - Do NOT repeat the percentile explanation more than once
-- Max 8–10 total sentences across both paragraphs
 - Tone: SaaS analytics product — clean, neutral, factual
 
+[SCOPE ISOLATION — STRATEGY ENGINE]
+- Use the structured strategy fields from STRATEGY FRAMEWORK directly.
+- Do NOT recompute strategy — it is pre-computed.
+- Do NOT restate percentile numbers in the strategy sections.
+- Do NOT repeat retention explanation in strategy sections.
+- Do NOT include subscriber totals or channel-wide averages.
+- Keep strategy sections concise and verbatim.
+
 [STRICT RULES]
-- Use the EXACT bold headings: **Video Health Overview** and **Diagnostic Interpretation**. No other headings.
+- Use the EXACT bold headings shown above. No other headings.
 - Always include ALL five diagnostic fields in the exact order shown.
-- Copy diagnostic values WORD FOR WORD from the VIDEO DIAGNOSTICS section.
+- Copy diagnostic and strategy values WORD FOR WORD from the provided sections.
 - Do NOT invert percentile values. If diagnostics say "outperformed 0%", write "outperformed 0%" — NEVER restate as "top 100%".
 - Do NOT recompute any fields from raw numbers.
 - If a field is Unknown, state it is unavailable — do NOT infer or estimate.
 - No emoji. No markdown tables. No raw JSON.
 - No summary paragraph. No closing question. No call-to-action.
-- End after the second paragraph. Do NOT add anything after it.
+- End after the Pattern Intelligence section. Do NOT add anything after it.
 
 [STRICTLY FORBIDDEN]
 You MUST NOT:
-- Suggest titles, thumbnails, or hook scripts
-- Offer strategic fixes or content changes
-- Recommend improvements or future targets
-- Propose next video ideas or growth strategies
-- Provide content strategy or creative direction
+- Hallucinate CTR, subscriber totals, or view counts not in the diagnostics
+- Mix channel-level analytics into video-level analysis
+- Recompute or invent missing themes or format biases
 - Ask follow-up questions (e.g. "Would you like...")
 - Add motivational language or encouragement
-- Use phrases: "next video", "you should", "consider doing", "to improve", "I recommend"
-- Add any sections beyond **Video Health Overview** and **Diagnostic Interpretation**"""
+- Use phrases: "you should", "consider doing", "to improve", "I recommend"
+- Add any sections beyond the six specified above"""
                 elif is_content_strategy:
                     instructions_block = """Instructions:
 - The user is asking a CONTENT STRATEGY question — "What should I upload next?"
@@ -1302,6 +1444,8 @@ Forbidden in channel-level responses:
 {video_analytics_section}
 
 {diagnostics_section}
+
+{pattern_section}
 
 {video_library_section}
 
@@ -1762,15 +1906,134 @@ User message: {clean_message}
             if median_views:
                 lines.append(f"- Channel Median Views: {median_views:,}")
 
+            # --- Strategy framework ---
+            strategy = compute_strategy_framework(
+                performance_tier, retention_category, momentum_status, format_type
+            )
+            lines.append("")
+            lines.append("## STRATEGY FRAMEWORK (pre-computed — use directly, do not recalculate)")
+            lines.append(f"- Strategy Mode: {strategy['strategy_mode']}")
+            lines.append(f"- Primary Focus: {strategy['primary_focus']}")
+            lines.append(f"- Secondary Focus: {strategy['secondary_focus']}")
+            lines.append(f"- Risk Level: {strategy['risk_level']}")
+            lines.append("- Recommended Actions:")
+            for i, action in enumerate(strategy['recommended_actions'], 1):
+                lines.append(f"  {i}. {action}")
+            lines.append(f"- Execution Pattern: {strategy['execution_pattern']}")
+
+            # --- Pattern Intelligence (Cross-Video) ---
+            try:
+                # Fetch videos directly from DB for pattern analysis
+                pattern_videos_orm = self.postgres_store.get_recent_videos(
+                    channel_uuid, limit=50
+                )
+                recent_videos = []
+                for v in pattern_videos_orm:
+                    recent_videos.append({
+                        "title": v.title or "",
+                        "views": v.view_count or 0,
+                        "duration_seconds": v.duration_seconds or 0,
+                        "format_type": "",
+                    })
+
+                clusters = cluster_by_keyword(recent_videos)
+                top_theme, top_stats = detect_top_theme(clusters)
+                worst_theme, worst_stats = detect_underperforming_theme(clusters)
+                format_bias = detect_format_bias(recent_videos)
+
+                lines.append("")
+                lines.append("## PATTERN INTELLIGENCE (pre-computed — use directly)")
+                if top_theme:
+                    lines.append(f"- Top Performing Theme: '{top_theme}' (Median Views: {top_stats['median_views']:,})")
+                else:
+                    lines.append("- Top Performing Theme: Insufficient data")
+                
+                if worst_theme:
+                    lines.append(f"- Underperforming Theme: '{worst_theme}' (Median Views: {worst_stats['median_views']:,})")
+                else:
+                    lines.append("- Underperforming Theme: Insufficient data")
+                    
+                lines.append("- Format Bias:")
+                lines.append(f"  - Bias Type: {format_bias['bias']}")
+                shorts_val = format_bias['shorts_median']
+                standard_val = format_bias['standard_median']
+                lines.append(f"  - Shorts Median Views: {shorts_val:,}" if shorts_val is not None else "  - Shorts Median Views: Insufficient data")
+                lines.append(f"  - Standard Median Views: {standard_val:,}" if standard_val is not None else "  - Standard Median Views: Insufficient data")
+                
+            except Exception as pe:
+                logger.warning(f"[Diagnostics] Failed to build pattern intelligence: {pe}")
+
             logger.debug(
                 f"[Diagnostics] tier={performance_tier}, retention={retention_category}, "
                 f"momentum={momentum_status}, format={format_type}, "
-                f"percentile={percentile_rank}"
+                f"percentile={percentile_rank}, strategy_mode={strategy['strategy_mode']}"
             )
             return "\n".join(lines)
 
         except Exception as e:
             logger.warning(f"[Diagnostics] Failed to build section: {e}")
+            return ""
+
+    def _build_pattern_section(
+        self,
+        channel_uuid,
+    ) -> str:
+        """
+        Build a standalone Pattern Intelligence section from video library.
+
+        Used exclusively for pattern_analysis intent — does NOT call
+        diagnostics or strategy. Pure pattern extraction only.
+
+        Returns:
+            Formatted pattern intelligence section string, or empty string on failure.
+        """
+        try:
+            videos_orm = self.postgres_store.get_recent_videos(
+                channel_uuid, limit=50
+            )
+            if not videos_orm:
+                return ""
+
+            recent_videos = []
+            for v in videos_orm:
+                recent_videos.append({
+                    "title": v.title or "",
+                    "views": v.view_count or 0,
+                    "duration_seconds": v.duration_seconds or 0,
+                    "format_type": "",
+                })
+
+            clusters = cluster_by_keyword(recent_videos)
+            top_theme, top_stats = detect_top_theme(clusters)
+            worst_theme, worst_stats = detect_underperforming_theme(clusters)
+            format_bias = detect_format_bias(recent_videos)
+
+            lines = ["## PATTERN INTELLIGENCE (pre-computed — use directly, do not recompute)"]
+            if top_theme:
+                lines.append(f"- Top Performing Theme: '{top_theme}' (Median Views: {top_stats['median_views']:,})")
+            else:
+                lines.append("- Top Performing Theme: Insufficient data")
+
+            if worst_theme:
+                lines.append(f"- Underperforming Theme: '{worst_theme}' (Median Views: {worst_stats['median_views']:,})")
+            else:
+                lines.append("- Underperforming Theme: Insufficient data")
+
+            lines.append("- Format Bias:")
+            lines.append(f"  - Bias Type: {format_bias['bias']}")
+            shorts_val = format_bias['shorts_median']
+            standard_val = format_bias['standard_median']
+            lines.append(f"  - Shorts Median Views: {shorts_val:,}" if shorts_val is not None else "  - Shorts Median Views: Insufficient data")
+            lines.append(f"  - Standard Median Views: {standard_val:,}" if standard_val is not None else "  - Standard Median Views: Insufficient data")
+
+            logger.debug(
+                f"[PatternIntelligence] top_theme={top_theme}, worst_theme={worst_theme}, "
+                f"bias={format_bias['bias']}"
+            )
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"[PatternIntelligence] Failed to build section: {e}")
             return ""
 
 
@@ -1919,6 +2182,36 @@ User message: {clean_message}
             r"\bscale my (channel|content)\b",
         ]
         return any(re.search(p, msg_lower) for p in growth_patterns)
+
+    def _is_pattern_query(
+        self, message: str, intent: str
+    ) -> bool:
+        """
+        Detect if the user is asking about cross-video patterns, themes, or format bias.
+
+        Args:
+            message: User's input message
+            intent: Classified intent from planner
+
+        Returns:
+            True if this is a pattern/theme query
+        """
+        import re
+        msg_lower = message.lower()
+        pattern_keywords = [
+            r"\btheme\b",
+            r"\bpattern\b",
+            r"\bacross videos\b",
+            r"\busually\b",
+            r"\btends? to\b",
+            r"\btype of content\b",
+            r"\bformat bias\b",
+            r"\b(what|which).*(theme|pattern|type|format).*(best|worst|perform|work)\b",
+            r"\b(best|worst|top|underperform).*(theme|pattern|type|topic)\b",
+            r"\bshorts vs\b",
+            r"\bstandard vs\b",
+        ]
+        return any(re.search(p, msg_lower) for p in pattern_keywords)
 
     def _is_top_video_query(self, message: str) -> bool:
         """

@@ -1166,6 +1166,12 @@ Extend the `_invoke_llm` method in `executor/execute.py` to support additional p
 
 ## Recent Updates
 
+### v1.4.0 — Pattern Intelligence & Intent Engine
+- **Semantic Topic Clustering**: Upgraded video clustering from single-token anchors to human-readable semantic categories (e.g., "playground adventure", "travel vlog") with secondary keyword fallbacks.
+- **Precision Format Bias Analysis**: Replaced proxy indicators with true ISO 8601 duration parsing (`PT1M30S` → integer) via YouTube API `contentDetails` ingestion, producing accurate Shorts vs. Standard performance medians.
+- **Surgical Intent Routing**: Refined classification boundaries—descriptive queries ("Which theme has the strongest lift?") route deterministically to the Pattern Engine, while prescriptive queries ("What should I scale?") route to the Strategy Engine.
+- **Context Isolation**: Hardened LLM memory injection to prevent stale, misaligned historical context from contaminating the deterministic outputs of the `pattern_analysis` intent.
+
 ### v1.3.0 — Infrastructure Hardening & Plan Enforcement
 - **Database Standardization**: Complete rename and separation to `creatorpilot` and `creatorpilot_admin`. Removal of legacy `context_hub` references.
 - **Proactive Video Ingestion**: Hardened ingestion logic to fetch strictly when `videos` table is empty, preventing unnecessary YouTube API calls.

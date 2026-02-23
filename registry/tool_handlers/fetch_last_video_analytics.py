@@ -8,6 +8,7 @@ This is a PRO-only tool that enables detailed video performance analysis.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
@@ -57,6 +58,32 @@ class YouTubeVideoFetcher:
         self._data_service = None
         self._analytics_service = None
         self._credentials = None
+
+    @staticmethod
+    def _parse_iso_duration(iso_str: str) -> int:
+        """
+        Parse ISO 8601 duration string (e.g., PT1M30S, PT1H2M30S) to seconds.
+
+        Args:
+            iso_str: YouTube contentDetails.duration string.
+
+        Returns:
+            Duration in seconds (0 if unparseable).
+        """
+        if not iso_str:
+            return 0
+
+        match = re.match(
+            r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_str
+        )
+        if not match:
+            return 0
+
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+
+        return hours * 3600 + minutes * 60 + seconds
     
     def _get_credentials(self) -> Credentials:
         """Build OAuth credentials with refresh support."""
@@ -187,20 +214,25 @@ class YouTubeVideoFetcher:
         for i in range(0, len(video_ids), 50):
             batch_ids = video_ids[i:i + 50]
             videos_response = service.videos().list(
-                part="snippet,statistics",
+                part="snippet,statistics,contentDetails",
                 id=",".join(batch_ids)
             ).execute()
             
             for video in videos_response.get("items", []):
                 snippet = video["snippet"]
                 stats = video.get("statistics", {})
+                content_details = video.get("contentDetails", {})
+                duration_seconds = self._parse_iso_duration(
+                    content_details.get("duration", "")
+                )
                 results.append({
                     "video_id": video["id"],
                     "title": snippet.get("title", "Untitled"),
                     "published_at": snippet.get("publishedAt"),
                     "views": int(stats.get("viewCount", 0)),
                     "likes": int(stats.get("likeCount", 0)),
-                    "comments": int(stats.get("commentCount", 0))
+                    "comments": int(stats.get("commentCount", 0)),
+                    "duration_seconds": duration_seconds,
                 })
         
         logger.info(f"[VideoIngestion] Fetched {len(results)} videos with stats")

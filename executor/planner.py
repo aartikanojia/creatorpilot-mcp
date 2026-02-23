@@ -84,9 +84,9 @@ class ExecutionPlanner:
             r"\b(ctr|click through rate|impression|retention|watch time)\b"
         ],
         "insight": [
-            r"\b(insight|recommend|suggest|advice|should|best)\b",
+            r"\b(insight|recommend|suggest|advice|should|best|strategy)\b",
             r"\b(why|reason|explain|understand)\b",
-            r"\b(improve|optimize|better|increase|decrease)\b"
+            r"\b(improve|optimize|better|increase|decrease|grow)\b"
         ],
         "report": [
             r"\b(report|summary|overview|digest|recap)\b",
@@ -107,6 +107,18 @@ class ExecutionPlanner:
             r"\b(find|search|look for|where|locate)\b",
             r"\b(show me|get|fetch|retrieve)\b",
             r"\b(list|display|what are)\b"
+        ],
+        "pattern_analysis": [
+            r"\b(theme|pattern|format)\b",
+            r"\bacross\s+(my\s+)?videos\b",
+            r"\busually\b",
+            r"\btends?\s+to\b",
+            r"\btype of content\b",
+            r"\bformat bias\b",
+            r"\b(what|which).*(theme|pattern|type|format).*(best|worst|perform|work)\b",
+            r"\b(best|worst|top|underperform|strongest|weakest).*(theme|pattern|type|topic)\b",
+            r"\bshorts\s+vs\b",
+            r"\bstandard\s+vs\b",
         ],
         "video_analysis": [
             r"\b(last|latest|recent|newest)\s+(video|upload|content)\b",
@@ -133,6 +145,7 @@ class ExecutionPlanner:
         "action": ["execute_action", "schedule_task"],
         "search": ["fetch_analytics", "search_data", "recall_context"],
         "video_analysis": ["fetch_last_video_analytics", "recall_context"],
+        "pattern_analysis": ["fetch_analytics", "recall_context"],
         "general": ["recall_context"]
     }
 
@@ -280,6 +293,22 @@ class ExecutionPlanner:
             logger.info("Account intent detected — skipping analytics")
             return ("account", 0.95)
 
+        # Pattern precedence override — only when clearly descriptive
+        # If insight also scored, pattern wins ONLY if strong descriptive
+        # anchors (theme/pattern/format) are present in the message.
+        pattern_score = scores.get("pattern_analysis", 0)
+        insight_score = scores.get("insight", 0)
+
+        if pattern_score > 0:
+            # Strong descriptive anchors — these nouns mean the user is
+            # asking ABOUT patterns, not asking for strategy advice
+            has_descriptive_anchor = bool(
+                re.search(r"\b(theme|pattern|format\s*bias)\b", message, re.IGNORECASE)
+            )
+            if insight_score == 0 or has_descriptive_anchor:
+                logger.info("Pattern intent precedence applied")
+                return ("pattern_analysis", 0.95)
+
         # Find the highest scoring intent
         if not any(scores.values()):
             return ("general", 0.5)
@@ -332,8 +361,11 @@ class ExecutionPlanner:
             # No channel context - no override
             return (current_intent, current_confidence)
 
-        # Never override account or video_analysis intent
-        if current_intent in ["account", "video_analysis"]:
+        # Never override account, video_analysis, or pattern_analysis intent
+        if current_intent in ["account", "video_analysis", "pattern_analysis"]:
+            logger.debug(
+                f"Override skipped for protected intent: {current_intent}"
+            )
             return (current_intent, current_confidence)
 
         # Analytics keywords that should trigger override
@@ -362,7 +394,8 @@ class ExecutionPlanner:
                     f"Analytics keyword matched: {pattern}")
                 break
 
-        if keyword_found:
+        if keyword_found and current_intent not in ["pattern_analysis"]:
+            logger.debug("Analytics override triggered")
             # Force analytics intent with high confidence
             return ("analytics", 0.95)
 
@@ -473,6 +506,14 @@ class ExecutionPlanner:
             Dictionary of parameter overrides
         """
         params = {}
+        # Force video library fetch for pattern analysis
+        if intent == "pattern_analysis":
+            return {
+                "period": "28d",
+                "fetch_library": True,
+                "compare_periods": False
+            }
+
         msg_lower = message.lower()
 
         # 1. Determine period (default to 7d)
