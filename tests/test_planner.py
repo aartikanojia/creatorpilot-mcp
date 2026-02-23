@@ -759,3 +759,65 @@ class TestVideoResolutionGuardrails:
         assert plan.intent_classification == "video_analysis"
         assert "extracted_title" not in plan.parameters
 
+
+# =============================================================================
+# CATEGORY 10: PATTERN ANALYSIS INTENT
+# =============================================================================
+
+class TestPatternAnalysisIntent:
+    """Tests for pattern_analysis intent classification."""
+
+    def test_what_theme_performs_best(self, planner, available_tools, channel_context):
+        plan = planner.create_plan(
+            "What theme performs best?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+
+    def test_which_type_underperforms(self, planner, available_tools, channel_context):
+        plan = planner.create_plan(
+            "Which type of content underperforms?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+
+    def test_shorts_vs_standard(self, planner, available_tools, channel_context):
+        plan = planner.create_plan(
+            "Is there a format bias between shorts vs standard?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+
+    def test_format_bias_query(self, planner, available_tools, channel_context):
+        plan = planner.create_plan(
+            "Is there a format bias in my channel?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+
+    def test_pattern_across_videos(self, planner, available_tools, channel_context):
+        plan = planner.create_plan(
+            "Do you see a pattern across my videos?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+
+    def test_pattern_does_not_match_last_video(self, planner, available_tools, channel_context):
+        """'Analyze my last video' should NOT route to pattern_analysis."""
+        plan = planner.create_plan(
+            "Analyze my last video", channel_context, available_tools
+        )
+        assert plan.intent_classification != "pattern_analysis"
+
+    def test_pattern_does_not_match_growth(self, planner, available_tools, channel_context):
+        """'How can I grow my channel?' should NOT route to pattern_analysis."""
+        plan = planner.create_plan(
+            "How can I grow my channel?", channel_context, available_tools
+        )
+        assert plan.intent_classification != "pattern_analysis"
+
+    def test_no_strategy_block_in_pattern_route(self, planner, available_tools, channel_context):
+        """Pattern analysis must NOT trigger strategy or diagnostics tools."""
+        plan = planner.create_plan(
+            "What theme performs best?", channel_context, available_tools
+        )
+        assert plan.intent_classification == "pattern_analysis"
+        # Should NOT trigger video-specific tool
+        assert "fetch_last_video_analytics" not in plan.tools_to_execute
+
+
