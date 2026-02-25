@@ -62,6 +62,8 @@ The **Model Context Protocol** is an architectural pattern for building robust A
 - **Fail-Open Architecture**: Redis-backed state management ensures resilient mobile experiences even on spotty networks
 - **Plan-Based Access Control**: Fully integrated FREE/PRO usage limits (3 requests/day for FREE) with server-side validation
 - **Advanced Video Diagnostics (Phase 1.1)**: Pure-Python deterministic diagnostic engine that extracts 5 structured health fields (Performance Tier, Percentile Rank, Retention Category, Momentum, Format) before invoking the LLM
+- **Strategy Ranking Engine (Phase 1.6)**: Deterministic Python module that mathematically ranks growth strategies based on constraint severity — completely bypasses LLM for strategy queries, producing zero-drift ranked output
+- **Archetype Classification**: Automatic channel archetype detection (Theme Type, Growth Constraint, Format Type, Performance Type) for constraint-first strategy recommendations
 - **UX-Grade AI Responses**: Enforced strict SaaS analytics formatting (structured health overview + 2-paragraph cohesive narrative) preventing generic, hallucinated, or subjective AI advice
 - **Extended Analytics**: Fast retrieval of CTR, impressions, retention, and traffic source metrics explicitly formatted for mobile charts
 - **Availability Flags**: Graceful handling of missing metrics with explicit flags to prevent mobile UI crashes
@@ -149,10 +151,12 @@ creatorpilot-mcp/
 ├── clients/               # External API clients
 │   └── youtube_analytics.py    # YouTube Analytics API OAuth client
 │
-├── analytics/             # Analytics processing
+├── analytics/             # Analytics & intelligence processing
 │   ├── context_builder.py # Build analytics context for LLM
 │   ├── fetcher.py         # Fetch data from YouTube Analytics API
-│   └── normalizer.py      # Normalize API responses to snapshot format
+│   ├── normalizer.py      # Normalize API responses to snapshot format
+│   ├── archetype.py       # Channel archetype classification engine
+│   └── strategy_ranker.py # Deterministic strategy ranking engine (Phase 1.6)
 │
 ├── db/                    # Database models and session management
 │   ├── __init__.py        # Package exports
@@ -176,12 +180,13 @@ creatorpilot-mcp/
 ├── scripts/               # Utility scripts
 │   └── init_db.py         # Database initialization script
 │
-├── tests/                 # Test suite (123 tests)
+├── tests/                 # Test suite (460 tests)
 │   ├── conftest.py        # Shared fixtures
 │   ├── test_server.py     # Server endpoint tests
 │   ├── test_orchestrator.py  # Orchestrator integration tests
 │   ├── test_planner.py    # Intent classification tests
-│   └── test_response_quality.py  # Response quality assertions
+│   ├── test_response_quality.py  # Response quality assertions
+│   └── test_strategy_ranker.py   # Strategy ranking engine tests (29 tests)
 │
 └── prompts/               # LLM prompt templates
     ├── system.txt         # Core system prompt
@@ -311,6 +316,59 @@ User ──┬── Channel ──┬── AnalyticsSnapshot
        │             ├── VideoSnapshot
        │             └── WeeklyInsight
        └── ChatSession
+```
+
+## Strategy Ranking Engine (Phase 1.6)
+
+A **deterministic Python module** that mathematically ranks growth strategies based on constraint severity. For strategy/growth queries, the engine completely **bypasses the LLM** — producing zero-drift ranked output.
+
+### Architecture
+
+```
+Metrics → ChannelMetrics → StrategyRankingEngine → StrategyResult → Direct Response
+                                                                     (No LLM)
+```
+
+### How It Works
+
+1. **Severity Calculation**: Each constraint is scored 0–10 using exact formulas:
+
+| Constraint | Formula | Example |
+|------------|---------|---------|
+| Retention | `(40 - retention) / 4` | retention=26% → severity=3.5 |
+| CTR | `(5 - ctr) * 2` | ctr=2% → severity=6.0 |
+| Conversion | `(0.5 - conversion) * 15` | conversion=0.04% → severity=6.9 |
+| Format Risk | `(shorts_ratio - 75) / 2` | shorts=95% → severity=10.0 |
+| Theme Risk | `(theme_concentration - 60) / 4` | theme=100% → severity=10.0 |
+
+2. **Primary Constraint**: Highest severity score wins
+3. **Strategy Mapping**: Each constraint maps to exactly 4 ranked strategies
+4. **Lift Estimation**: Constraint-specific lift ranges (e.g., Retention severe: 10–20%)
+5. **Confidence Model**: Based on data completeness (0.5–1.0)
+
+### Strategy Tables
+
+| Constraint | Strategies |
+|------------|-----------|
+| Retention | Hook Optimization, Pacing Compression, Series Structuring, Pattern Replication |
+| Conversion | CTA Optimization, Value Framing, Subscriber Loop Creation, Community Hooks |
+| CTR | Title Optimization, Thumbnail Rework, Curiosity Gap Engineering, Packaging Alignment |
+| Format Risk | Format Diversification, Long-Form Expansion, Cross-Format Funnel, Upload Distribution Balance |
+| Theme Risk | Theme Expansion, Adjacent Topic Testing, Controlled Diversification, Content Radar Buildout |
+
+### Output Format
+
+```
+Primary Constraint: Retention
+Severity Score: 3.5
+
+Strategies:
+1. Hook Optimization — Estimated Lift: 10–20%
+2. Pacing Compression — Estimated Lift: 10–20%
+3. Series Structuring — Estimated Lift: 10–20%
+4. Pattern Replication — Estimated Lift: 10–20%
+
+Confidence: 0.9
 ```
 
 ## Quick Start

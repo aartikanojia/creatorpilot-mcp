@@ -132,7 +132,22 @@ class ExecutionPlanner:
             r'"[^"]+?"',                                     # quoted title
             r"\b(this|my)\s+video\b",                        # "this video", "my video"
             r"\b(tell me about|analyze|how.*(did|is)).*video\b",  # title fragment
-        ]
+        ],
+        "structural_analysis": [
+            r"\blibrary underperforming\b",
+            r"\bstructural weakness\b",
+            r"\bchannel structure\b",
+            r"\bformat balanced\b",
+            r"\btheme dominant\b",
+            r"\bgrowth constrained\b",
+            r"\bperformance type\b",
+            r"\bstructural diagnosis\b",
+            r"\bstructurally\b",
+            r"\bdiagnose.*channel\b",
+            r"\bam i format balanced\b",
+            r"\bam i theme concentrated\b",
+            r"\bis my growth constrained\b",
+        ],
     }
 
     # Maps intents to relevant tools
@@ -146,6 +161,7 @@ class ExecutionPlanner:
         "search": ["fetch_analytics", "search_data", "recall_context"],
         "video_analysis": ["fetch_last_video_analytics", "recall_context"],
         "pattern_analysis": ["fetch_analytics", "recall_context"],
+        "structural_analysis": [],  # No tools — pure deterministic archetype
         "general": ["recall_context"]
     }
 
@@ -286,6 +302,11 @@ class ExecutionPlanner:
                 matches = pattern.findall(message)
                 score += len(matches)
             scores[intent] = score
+
+        # Structural analysis takes absolute priority — deterministic, no LLM
+        if scores.get("structural_analysis", 0) > 0:
+            logger.info("Structural analysis intent detected")
+            return ("structural_analysis", 0.98)
 
         # Account intent takes absolute priority — if any account
         # pattern matched, return immediately regardless of other scores.

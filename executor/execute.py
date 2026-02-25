@@ -46,6 +46,8 @@ from analytics.patterns import (
     detect_underperforming_theme,
     detect_format_bias,
 )
+from analytics.archetype import ArchetypeAnalyzer
+from analytics.strategy_ranker import StrategyRankingEngine, ChannelMetrics
 from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count, get_latest_video_from_db
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,16 @@ class ContextOrchestrator:
 
     # Request limits by plan
     FREE_DAILY_LIMIT = 3
+
+    # Identity query patterns — deterministic archetype rendering, no LLM
+    IDENTITY_PATTERNS = [
+        r"\bwhat type of channel\b",
+        r"\bchannel identity\b",
+        r"\bdiagnose my channel\b",
+        r"\bstructurally\b",
+        r"\bwhat kind of channel\b",
+        r"\bchannel archetype\b",
+    ]
 
     def __init__(self) -> None:
         """Initialize orchestrator with all required components."""
@@ -562,15 +574,104 @@ class ContextOrchestrator:
                 approved_tools, message, memory_context, plan.parameters
             )
 
+        # Step 4.5: Identity intercept — deterministic archetype, no LLM
+        if channel_uuid and self._is_identity_query(message):
+            logger.info("[IdentityRoute] Identity query detected — deterministic render")
+            try:
+                archetype_response = self._compute_and_render_archetype(channel_uuid)
+                if archetype_response:
+                    # Store conversation
+                    await self._store_conversation(
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        message=message,
+                        response=archetype_response,
+                        tools_used=[t.tool_name for t in tool_results]
+                    )
+                    self._persist_to_postgres(
+                        user_uuid=user_uuid,
+                        channel_uuid=channel_uuid,
+                        message=message,
+                        response=archetype_response,
+                        tool_results=tool_results,
+                        confidence=plan.confidence if hasattr(plan, "confidence") else None
+                    )
+                    metadata["usage"] = usage_metadata
+                    return ExecuteResponse(
+                        success=True,
+                        content=archetype_response,
+                        metadata={
+                            "intent": "identity",
+                            "confidence": 1.0,
+                            "deterministic": True,
+                            "user_plan": user_plan,
+                            "usage": usage_metadata,
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"[IdentityRoute] Archetype render failed, falling through to LLM: {e}")
+
+        # Step 4.6: Structural analysis intercept — deterministic archetype, no LLM
+        if plan.intent_classification == "structural_analysis" and channel_uuid:
+            logger.info("[StructuralRoute] Structural analysis detected — deterministic render")
+            try:
+                archetype = self._compute_archetype(channel_uuid)
+                if archetype:
+                    structural_response = self._render_structural_response(archetype, message)
+                    # Store conversation
+                    await self._store_conversation(
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        message=message,
+                        response=structural_response,
+                        tools_used=[]
+                    )
+                    self._persist_to_postgres(
+                        user_uuid=user_uuid,
+                        channel_uuid=channel_uuid,
+                        message=message,
+                        response=structural_response,
+                        tool_results=[],
+                        confidence=plan.confidence if hasattr(plan, "confidence") else None
+                    )
+                    metadata["usage"] = usage_metadata
+                    return ExecuteResponse(
+                        success=True,
+                        content=structural_response,
+                        metadata={
+                            "intent": "structural_analysis",
+                            "confidence": 0.98,
+                            "deterministic": True,
+                            "user_plan": user_plan,
+                            "usage": usage_metadata,
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"[StructuralRoute] Archetype render failed, falling through to LLM: {e}")
+
         # Step 5: Call LLM with full context (including historical)
         logger.debug("Calling LLM")
-        llm_response = await self._call_llm(
-            message=message,
-            memory_context=memory_context,
-            tool_results=tool_results,
-            plan=plan,
-            channel_uuid=channel_uuid
-        )
+        try:
+            llm_response = await self._call_llm(
+                message=message,
+                memory_context=memory_context,
+                tool_results=tool_results,
+                plan=plan,
+                channel_uuid=channel_uuid
+            )
+        except Exception as llm_err:
+            logger.error(f"LLM call failed: {llm_err}")
+            metadata["usage"] = usage_metadata
+            return ExecuteResponse(
+                success=False,
+                content="",
+                error=f"AI generation failed. Please try again.",
+                metadata={
+                    "intent": plan.intent_classification,
+                    "user_plan": user_plan,
+                    "usage": usage_metadata,
+                }
+            )
 
         # Step 6: Store conversation in short-term memory (Redis)
         await self._store_conversation(
@@ -1092,6 +1193,24 @@ class ContextOrchestrator:
         full_context = "\n".join(
             context_parts) if context_parts else "No additional context."
 
+        # For insight intent, replace bloated context with minimal structured metrics
+        if plan.intent_classification == "insight":
+            retention = analytics_context.get("avg_view_pct") or analytics_context.get("averageViewPercentage") or 0
+            views = analytics_context.get("views") or analytics_context.get("total_views") or 0
+            subs_gained = analytics_context.get("subscribersGained") or analytics_context.get("subscribers_gained") or 0
+            traffic = analytics_context.get("traffic_sources", {})
+            shorts_views = traffic.get("SHORTS", 0) if isinstance(traffic, dict) else 0
+            total_views = max(views, 1)
+            shorts_ratio = round(shorts_views / total_views, 2) if shorts_views else 0
+
+            full_context = f"""[METRICS]
+Retention: {retention}
+Views (7d): {views}
+Shorts Ratio: {shorts_ratio}"""
+            # Strip competing bottleneck signals from context
+            # If archetype is available and constraint is NOT conversion, hide sub data
+            logger.info(f"[InsightOptim] Compact context: {len(full_context)} chars (retention={retention}, views={views})")
+
         # Build structured analytics section
         # HARD GUARDRAIL: Only inject analytics prompt section for analytics intents
         if plan.intent_classification in analytics_intents:
@@ -1100,12 +1219,16 @@ class ContextOrchestrator:
             analytics_section = ""
 
         # Build video analytics section from tool results
-        video_analytics_section = self._build_video_analytics_prompt_section(tool_results)
+        # Only inject for video_analysis — all other intents use structured context
+        if plan.intent_classification == "video_analysis":
+            video_analytics_section = self._build_video_analytics_prompt_section(tool_results)
+        else:
+            video_analytics_section = ""
 
-        # Build video library section from DB — inject for all intents EXCEPT pattern_analysis
-        # pattern_analysis uses its own pre-computed pattern_section (filtered tokens)
-        # Injecting raw titles would cause the LLM to ignore pre-computed data
-        if plan.intent_classification != "pattern_analysis":
+        # Build video library section from DB
+        # Only inject for video_analysis and search — these need per-video data
+        # All other intents skip this to keep prompt compact
+        if plan.intent_classification in ("video_analysis", "search"):
             video_library_section = self._build_video_library_from_db(channel_uuid)
         else:
             video_library_section = ""
@@ -1131,6 +1254,125 @@ class ContextOrchestrator:
                 logger.info(f"[PatternRoute] Preview: {pattern_section[:200]}")
         else:
             logger.info(f"[PatternRoute] Skipped — intent={plan.intent_classification}, channel_uuid={channel_uuid}")
+
+        # Build archetype context for strategy intents (Phase 1.5)
+        archetype_section = ""
+        strategy_ranking_section = ""
+        if plan.intent_classification in ("insight", "analytics", "general") and channel_uuid:
+            try:
+                archetype = self._compute_archetype(channel_uuid)
+                if archetype:
+                    # Deterministic guard: force primary focus based on constraint
+                    primary_focus = "General Growth"
+                    if archetype.growth_constraint == "Retention-Constrained":
+                        primary_focus = "Retention Optimization"
+                    elif archetype.growth_constraint == "Conversion-Constrained":
+                        primary_focus = "Subscriber Conversion"
+                    elif archetype.growth_constraint == "Momentum-Declining":
+                        primary_focus = "Momentum Recovery"
+
+                    archetype_section = f"""## ARCHETYPE CONTEXT (pre-computed — use directly, do not contradict)
+
+GROWTH_CONSTRAINT_LOCK: {archetype.growth_constraint}
+You MUST treat this as the primary bottleneck.
+Do NOT override it based on other metrics.
+Do NOT reclassify the channel.
+
+Channel Identity:
+- Format Type: {archetype.format_type}
+- Theme Type: {archetype.theme_type}
+- Growth Constraint: {archetype.growth_constraint}
+- Performance Type: {archetype.performance_type}
+- Primary Focus: {primary_focus}
+
+STRATEGY ADAPTATION RULES:
+
+1. If Growth Constraint = Retention-Constrained:
+   → Lead with hook engineering and pacing optimization.
+   → Do NOT suggest distribution scaling first.
+
+2. If Growth Constraint = Conversion-Constrained:
+   → Focus on CTA, subscriber psychology, loyalty mechanics.
+
+3. If Theme Type = Theme-Concentrated:
+   → Warn about creative fragility.
+   → Suggest controlled thematic expansion.
+
+4. If Format Type contains Dominant:
+   → Recommend diversification testing.
+   → Warn about algorithmic dependency risk.
+
+5. If Performance Type = Underperforming Library:
+   → Focus on packaging, topic-market mismatch, title/thumbnail testing.
+
+6. If Performance Type = Stable Library:
+   → Recommend scaling winning pattern, not pivoting.
+
+MANDATORY OPENING LINE:
+Strategy output MUST begin with:
+"As a {archetype.theme_type}, {archetype.growth_constraint} channel..."
+
+CLASSIFICATION AUTHORITY:
+- You are NOT allowed to re-evaluate growth constraint.
+- You MUST use GROWTH_CONSTRAINT_LOCK as authoritative.
+- Even if other metrics appear more relevant, do NOT switch bottleneck.
+- The constraint was computed by the diagnostics layer and is final.
+- Do not give generic YouTube advice.
+- Primary Focus MUST be: {primary_focus}
+
+Constraint Priority Hierarchy (system-level, non-negotiable):
+1. Retention (affects distribution — highest priority)
+2. Conversion (affects scaling — second priority)
+3. Momentum (affects trajectory — third priority)
+Never invert this order. Never reclassify."""
+                    plan.parameters["growth_constraint"] = archetype.growth_constraint
+                    plan.parameters["archetype"] = {
+                        "format_type": archetype.format_type,
+                        "theme_type": archetype.theme_type,
+                        "growth_constraint": archetype.growth_constraint,
+                        "performance_type": archetype.performance_type,
+                    }
+                    logger.info(f"[ArchetypeRoute] Archetype injected: {archetype.format_type}, {archetype.theme_type}, {archetype.growth_constraint}, {archetype.performance_type}")
+                    self._last_archetype = plan.parameters["archetype"]
+
+                    # Compute deterministic strategy ranking
+                    try:
+                        retention_val = None
+                        conversion_pct = None
+                        shorts_pct = None
+
+                        try:
+                            snapshot = self.postgres_store.get_latest_analytics_snapshot(channel_uuid)
+                            if snapshot:
+                                retention_val = snapshot.avg_view_percentage or None
+                                views = snapshot.views or 0
+                                subs = snapshot.subscribers_gained or 0
+                                if views > 0:
+                                    conversion_pct = round((subs / views) * 100, 4)
+                                # Compute shorts ratio from traffic sources
+                                traffic = analytics_context.get("traffic_sources", {})
+                                shorts_views = traffic.get("SHORTS", 0) if isinstance(traffic, dict) else 0
+                                total_views = max(views, 1)
+                                if shorts_views:
+                                    shorts_pct = round((shorts_views / total_views) * 100, 1)
+                        except Exception:
+                            pass
+
+                        metrics = ChannelMetrics(
+                            retention=retention_val,
+                            conversion=conversion_pct,
+                            shorts_ratio=shorts_pct,
+                            theme_concentration=80,  # TODO: compute from pattern data
+                        )
+                        ranker = StrategyRankingEngine()
+                        result = ranker.rank(metrics)
+                        strategy_ranking_section = ranker.render(result)
+                        logger.info(f"[StrategyRanker] {result.primary_constraint}, severity={result.severity_score}, confidence={result.confidence}")
+                    except Exception as e:
+                        logger.warning(f"[StrategyRanker] Failed: {e}")
+                        strategy_ranking_section = ""
+            except Exception as e:
+                logger.warning(f"[ArchetypeRoute] Failed to build archetype section: {e}")
 
         # Parse and strip [TOP_VIDEO_CONTEXT] metadata from message
         clean_message, top_video_meta = self._parse_top_video_context(message)
@@ -1393,32 +1635,27 @@ You MUST NOT:
 - No markdown tables. No raw JSON. No emoji.
 - Tone: creative strategist who knows the data inside-out."""
                 elif is_growth_query:
-                    instructions_block = """Instructions:
-- The user is asking a GROWTH question — "How can I grow faster?"
-- Follow the GROWTH ANALYSIS TEMPLATE from the analysis prompt.
-- Lead with the Growth Bottleneck Diagnosis: name the #1 constraint with its metric.
-- Then cover Leverage What's Working: identify the replicable content pattern or traffic source.
-- Give 2–3 Targeted Growth Moves that directly address the diagnosed bottleneck.
-- End with Strategic Expansion: how to scale beyond the current pattern (series, formats, cross-platform).
-- Each move must pass: "Is this specific to THIS channel's data, or could it apply to anyone?"
-- Do NOT suggest generic phrases like "improve thumbnails" or "engage your audience."
-- No markdown tables. No raw JSON. No emoji.
-- Tone: strategic growth advisor reviewing a performance dashboard."""
+                    instructions_block = """Format this cleanly.
+Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Then output the strategy ranking section exactly as provided.
+No additional commentary. No expansion. No motivational content. No examples.
+Stop after Confidence line."""
+                else:
+                    instructions_block = """Format this cleanly.
+Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Then output the strategy ranking section exactly as provided.
+No additional commentary. No expansion. No motivational content. No examples.
+Stop after Confidence line."""
+            else:
+                # If archetype context is available, use minimal formatting
+                if archetype_section:
+                    instructions_block = """Format this cleanly.
+Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Then output the strategy ranking section exactly as provided.
+No additional commentary. No expansion. No motivational content. No examples.
+Stop after Confidence line."""
                 else:
                     instructions_block = """Instructions:
-- DIAGNOSE FIRST: Identify the #1 bottleneck (retention, CTR, traffic source, subscriber conversion, or distribution) before any recommendation.
-- State the bottleneck explicitly in the first paragraph.
-- Do NOT list metrics without interpreting them. Metrics are evidence, not the response.
-- Every recommendation must directly address the diagnosed bottleneck.
-- If retention > 50%, do NOT suggest retention improvements. Focus on distribution/packaging.
-- If traffic is Shorts-dominated, apply Shorts-specific strategy — not long-form logic.
-- Give 2–3 high-impact moves MAXIMUM. No spray-and-pray advice lists.
-- Each recommendation must pass: "Is this specific to THIS channel's data, or could it apply to anyone?"
-- Do NOT use generic phrases like "improve thumbnails" or "engage your audience."
-- No markdown tables. No raw JSON. No emoji.
-- Tone: strategic growth advisor reviewing a performance dashboard."""
-            else:
-                instructions_block = """Instructions:
 - Answer the user's question directly and confidently.
 - If the user asks about video performance (most watched, most liked, best performing, recent videos), ALWAYS use the VIDEO LIBRARY section above — it contains title, date, views, likes, and comments for all stored videos.
 - To answer "most watched in last X days": look at the VIDEO LIBRARY, filter by published date, and rank by views. State the answer directly.
@@ -1434,7 +1671,37 @@ Forbidden in channel-level responses:
 - Do NOT include per-video analytics (engagement rate, avg watch time per video, or likes per video) unless the user explicitly asked about a specific video.
 - Do NOT reference individual video IDs or specific video performance metrics in a channel summary."""
 
-            full_prompt = f"""
+        # ──────────────────────────────────────────────
+        # LLM BYPASS — Strategy Ranking Engine
+        # If we have a pre-computed strategy ranking AND this is a
+        # strategy/growth/insight query, return directly. No LLM.
+        # ──────────────────────────────────────────────
+        if strategy_ranking_section and not is_top_video:
+            # Only bypass for strategy-relevant queries (not video_analysis, not content_strategy)
+            is_strategy_bypass = (
+                is_growth_query
+                or plan.intent_classification in ("insight", "analytics", "general")
+            ) and not is_content_strategy
+
+            if is_strategy_bypass:
+                # Build direct output — no LLM
+                archetype_opening = ""
+                if archetype_section and hasattr(self, '_last_archetype'):
+                    a = self._last_archetype
+                    archetype_opening = (
+                        f"As a {a.get('theme_type', 'Theme-Concentrated')}, "
+                        f"{a.get('growth_constraint', 'Retention-Constrained')} channel:\n\n"
+                    )
+
+                direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}"
+                logger.info(f"[StrategyBypass] Returning pre-computed ranking directly — NO LLM call")
+                return direct_response
+
+        # ──────────────────────────────────────────────
+        # Standard LLM path (non-strategy queries)
+        # ──────────────────────────────────────────────
+
+        full_prompt = f"""
 {system_prompt}
 
 {analysis_section_prompt}
@@ -1447,6 +1714,10 @@ Forbidden in channel-level responses:
 
 {pattern_section}
 
+{archetype_section}
+
+{strategy_ranking_section}
+
 {video_library_section}
 
 Context:
@@ -1456,6 +1727,18 @@ User message: {clean_message}
 
 {instructions_block}
 """
+
+        # Prompt size guardrail
+        if len(full_prompt) > 15000:
+            logger.warning(f"Prompt too large ({len(full_prompt)} chars) — compressing")
+            lines = full_prompt.split("\n")
+            filtered = [
+                line for line in lines
+                if not line.strip().startswith("Video Library:")
+                and not line.strip().startswith("- Video:")
+            ]
+            full_prompt = "\n".join(filtered[:400])  # hard cap at 400 lines
+            logger.info(f"Compressed prompt to {len(full_prompt)} chars")
 
         # Call LLM
         response = await self._invoke_llm(full_prompt)
@@ -1963,6 +2246,33 @@ User message: {clean_message}
             except Exception as pe:
                 logger.warning(f"[Diagnostics] Failed to build pattern intelligence: {pe}")
 
+            # --- Channel Archetype Classification (Phase 1.4) ---
+            try:
+                pattern_data = {
+                    "shorts_median": format_bias.get("shorts_median") if 'format_bias' in dir() else None,
+                    "standard_median": format_bias.get("standard_median") if 'format_bias' in dir() else None,
+                    "top_median": top_stats["median_views"] if 'top_stats' in dir() and top_stats else None,
+                    "second_median": worst_stats["median_views"] if 'worst_stats' in dir() and worst_stats else None,
+                }
+                diagnostics_data_for_arch = {
+                    "momentum_status": momentum_status,
+                    "percentile_distribution": [percentile_rank] if percentile_rank is not None else [],
+                }
+                channel_metrics_for_arch = self._build_channel_metrics(channel_uuid)
+                archetype = ArchetypeAnalyzer().classify(
+                    pattern_data=pattern_data,
+                    diagnostics_data=diagnostics_data_for_arch,
+                    channel_metrics=channel_metrics_for_arch,
+                )
+                lines.append("")
+                lines.append("## CHANNEL IDENTITY (pre-computed — use directly)")
+                lines.append(f"- Format Type: {archetype.format_type}")
+                lines.append(f"- Theme Type: {archetype.theme_type}")
+                lines.append(f"- Growth Constraint: {archetype.growth_constraint}")
+                lines.append(f"- Performance Type: {archetype.performance_type}")
+            except Exception as ae:
+                logger.warning(f"[Diagnostics] Failed to build archetype: {ae}")
+
             logger.debug(
                 f"[Diagnostics] tier={performance_tier}, retention={retention_category}, "
                 f"momentum={momentum_status}, format={format_type}, "
@@ -2026,6 +2336,39 @@ User message: {clean_message}
             lines.append(f"  - Shorts Median Views: {shorts_val:,}" if shorts_val is not None else "  - Shorts Median Views: Insufficient data")
             lines.append(f"  - Standard Median Views: {standard_val:,}" if standard_val is not None else "  - Standard Median Views: Insufficient data")
 
+            # --- Channel Archetype Classification (Phase 1.4) ---
+            try:
+                # Build pattern_data from computed signals
+                pattern_data = {
+                    "shorts_median": format_bias.get("shorts_median"),
+                    "standard_median": format_bias.get("standard_median"),
+                    "top_median": top_stats["median_views"] if top_stats else None,
+                    "second_median": worst_stats["median_views"] if worst_stats else None,
+                }
+                # Fetch channel-level metrics from latest analytics snapshot
+                diagnostics_data_for_arch = {
+                    "momentum_status": None,
+                    "percentile_distribution": [
+                        compute_percentile_rank(v.get("views", 0), [vid.get("views", 0) for vid in recent_videos])
+                        for v in recent_videos if v.get("views") is not None
+                    ],
+                }
+                channel_metrics_for_arch = self._build_channel_metrics(channel_uuid)
+
+                archetype = ArchetypeAnalyzer().classify(
+                    pattern_data=pattern_data,
+                    diagnostics_data=diagnostics_data_for_arch,
+                    channel_metrics=channel_metrics_for_arch,
+                )
+                lines.append("")
+                lines.append("## CHANNEL IDENTITY (pre-computed — use directly)")
+                lines.append(f"- Format Type: {archetype.format_type}")
+                lines.append(f"- Theme Type: {archetype.theme_type}")
+                lines.append(f"- Growth Constraint: {archetype.growth_constraint}")
+                lines.append(f"- Performance Type: {archetype.performance_type}")
+            except Exception as ae:
+                logger.warning(f"[PatternIntelligence] Failed to build archetype: {ae}")
+
             logger.debug(
                 f"[PatternIntelligence] top_theme={top_theme}, worst_theme={worst_theme}, "
                 f"bias={format_bias['bias']}"
@@ -2036,6 +2379,202 @@ User message: {clean_message}
             logger.warning(f"[PatternIntelligence] Failed to build section: {e}")
             return ""
 
+    def _is_identity_query(self, message: str) -> bool:
+        """
+        Check if the user's message is an identity/archetype query.
+
+        Returns True if any IDENTITY_PATTERNS match.
+        """
+        for pattern in self.IDENTITY_PATTERNS:
+            if re.search(pattern, message, re.IGNORECASE):
+                return True
+        return False
+
+    def _compute_and_render_archetype(self, channel_uuid) -> Optional[str]:
+        """
+        Compute channel archetype and render as deterministic text block.
+
+        Fetches videos and analytics snapshot from DB, runs all classifiers,
+        and returns a formatted archetype block. No LLM involved.
+
+        Returns:
+            Formatted archetype string, or None on failure.
+        """
+        # Fetch videos for pattern data
+        videos_orm = self.postgres_store.get_recent_videos(
+            channel_uuid, limit=50
+        )
+        if not videos_orm:
+            return None
+
+        recent_videos = []
+        for v in videos_orm:
+            recent_videos.append({
+                "title": v.title or "",
+                "views": v.view_count or 0,
+                "duration_seconds": v.duration_seconds or 0,
+                "format_type": "",
+            })
+
+        # Compute pattern signals
+        clusters = cluster_by_keyword(recent_videos)
+        top_theme, top_stats = detect_top_theme(clusters)
+        worst_theme, worst_stats = detect_underperforming_theme(clusters)
+        format_bias = detect_format_bias(recent_videos)
+
+        # Build pattern_data for archetype
+        pattern_data = {
+            "shorts_median": format_bias.get("shorts_median"),
+            "standard_median": format_bias.get("standard_median"),
+            "top_median": top_stats["median_views"] if top_stats else None,
+            "second_median": worst_stats["median_views"] if worst_stats else None,
+        }
+
+        channel_metrics = self._build_channel_metrics(channel_uuid)
+        diagnostics_data = {
+            "momentum_status": None,
+            "percentile_distribution": [
+                compute_percentile_rank(v.get("views", 0), [vid.get("views", 0) for vid in recent_videos])
+                for v in recent_videos if v.get("views") is not None
+            ],
+        }
+
+        # Classify
+        archetype = ArchetypeAnalyzer().classify(
+            pattern_data=pattern_data,
+            diagnostics_data=diagnostics_data,
+            channel_metrics=channel_metrics,
+        )
+
+        # Render deterministic block
+        return (
+            f"**Channel Identity**\n\n"
+            f"- **Format Type:** {archetype.format_type}\n"
+            f"- **Theme Type:** {archetype.theme_type}\n"
+            f"- **Growth Constraint:** {archetype.growth_constraint}\n"
+            f"- **Performance Type:** {archetype.performance_type}"
+        )
+
+    def _build_channel_metrics(self, channel_uuid) -> dict:
+        """
+        Build channel metrics from latest analytics snapshot.
+
+        Single source of truth for retention and conversion.
+        Always uses snapshot (stable) — not live per-request analytics.
+        """
+        channel_metrics = {
+            "avg_view_pct": 0,
+            "sub_conversion_rate": 0,
+        }
+        try:
+            snapshot = self.postgres_store.get_latest_analytics_snapshot(channel_uuid)
+            if snapshot:
+                channel_metrics["avg_view_pct"] = snapshot.avg_view_percentage or 0
+                # Compute sub_conversion_rate if data available
+                if hasattr(snapshot, 'subscribers_gained') and hasattr(snapshot, 'views'):
+                    views = snapshot.views or 0
+                    subs = snapshot.subscribers_gained or 0
+                    if views > 0:
+                        channel_metrics["sub_conversion_rate"] = round(subs / views, 4)
+        except Exception as e:
+            logger.warning(f"Failed to fetch channel metrics from snapshot: {e}")
+        return channel_metrics
+
+    def _compute_archetype(self, channel_uuid):
+        """
+        Compute channel archetype from DB data.
+
+        Returns a ChannelArchetype object, or None on failure.
+        """
+        # Fetch videos for pattern data
+        videos_orm = self.postgres_store.get_recent_videos(
+            channel_uuid, limit=50
+        )
+        if not videos_orm:
+            return None
+
+        recent_videos = []
+        for v in videos_orm:
+            recent_videos.append({
+                "title": v.title or "",
+                "views": v.view_count or 0,
+                "duration_seconds": v.duration_seconds or 0,
+                "format_type": "",
+            })
+
+        clusters = cluster_by_keyword(recent_videos)
+        top_theme, top_stats = detect_top_theme(clusters)
+        worst_theme, worst_stats = detect_underperforming_theme(clusters)
+        format_bias = detect_format_bias(recent_videos)
+
+        pattern_data = {
+            "shorts_median": format_bias.get("shorts_median"),
+            "standard_median": format_bias.get("standard_median"),
+            "top_median": top_stats["median_views"] if top_stats else None,
+            "second_median": worst_stats["median_views"] if worst_stats else None,
+        }
+
+        channel_metrics = self._build_channel_metrics(channel_uuid)
+        diagnostics_data = {
+            "momentum_status": None,
+            "percentile_distribution": [
+                compute_percentile_rank(v.get("views", 0), [vid.get("views", 0) for vid in recent_videos])
+                for v in recent_videos if v.get("views") is not None
+            ],
+        }
+
+        return ArchetypeAnalyzer().classify(
+            pattern_data=pattern_data,
+            diagnostics_data=diagnostics_data,
+            channel_metrics=channel_metrics,
+        )
+
+    @staticmethod
+    def _render_structural_response(archetype, message: str) -> str:
+        """
+        Render a context-sensitive structural response from an archetype.
+
+        No LLM. No narrative. Pure structural output.
+        """
+        msg = message.lower()
+
+        # Library-specific query
+        if "library" in msg:
+            return (
+                f"**Library Performance Status**\n\n"
+                f"- **Performance Type:** {archetype.performance_type}"
+            )
+
+        # Weakness-specific query
+        if "weakness" in msg:
+            weaknesses = []
+
+            if archetype.theme_type == "Theme-Concentrated":
+                weaknesses.append("Theme concentration risk")
+
+            if "Dominant" in archetype.format_type:
+                weaknesses.append("Format dependency risk")
+
+            if archetype.growth_constraint == "Retention-Constrained":
+                weaknesses.append("Retention constraint")
+
+            if archetype.performance_type == "Underperforming Library":
+                weaknesses.append("Library performance weakness")
+
+            if not weaknesses:
+                weaknesses.append("No structural weakness detected")
+
+            bullet_lines = "\n".join(f"- {w}" for w in weaknesses)
+            return f"**Structural Weakness**\n\n{bullet_lines}"
+
+        # Default: full identity block
+        return (
+            f"**Channel Identity**\n\n"
+            f"- **Format Type:** {archetype.format_type}\n"
+            f"- **Theme Type:** {archetype.theme_type}\n"
+            f"- **Growth Constraint:** {archetype.growth_constraint}\n"
+            f"- **Performance Type:** {archetype.performance_type}"
+        )
 
 
     async def _invoke_llm(self, prompt: str) -> str:

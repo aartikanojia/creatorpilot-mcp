@@ -29,7 +29,7 @@ class LangChainGeminiClient:
             model=self.model_name,
             google_api_key=self.api_key,
             temperature=0.3,
-            max_output_tokens=2048,  # Increased for longer responses
+            max_output_tokens=900,  # Insight answers are 400-700 tokens max
             convert_system_message_to_human=True  # Gemini sometimes needs this
         )
         
@@ -76,4 +76,4 @@ class LangChainGeminiClient:
             return str(content) if content else ""
         except Exception as e:
             logger.error(f"LangChain Gemini generation failed: {e}")
-            return f"Error generating response: {str(e)}"
+            raise RuntimeError(f"Gemini generation failed: {e}") from e

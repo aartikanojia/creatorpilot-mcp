@@ -45,6 +45,7 @@ class LangChainAzureClient:
             deployment_name=self.deployment_name,
             temperature=0.3,
             max_tokens=4096,
+            max_retries=3,
         )
 
         logger.info(
@@ -93,15 +94,14 @@ class LangChainAzureClient:
 
         except Exception as e:
             error_msg = str(e).lower()
-            # Detect Azure content filter and fallback to Gemini
-            if "content filter" in error_msg or "content_filter" in error_msg:
-                logger.warning(
-                    f"Azure content filter triggered, attempting Gemini fallback: {e}"
-                )
+            logger.warning(
+                f"Azure OpenAI failed ({type(e).__name__}), attempting Gemini fallback: {e}"
+            )
+            try:
                 return self._gemini_fallback(prompt)
-
-            logger.error(f"LangChain Azure OpenAI generation failed: {e}")
-            return f"Error generating response: {str(e)}"
+            except Exception as fallback_err:
+                logger.error(f"Both Azure and Gemini failed. Azure: {e}, Gemini: {fallback_err}")
+                raise RuntimeError(f"All LLM providers failed. Azure: {e}") from e
 
     def _gemini_fallback(self, prompt: str) -> str:
         """Retry the prompt using Gemini when Azure content filter blocks."""
