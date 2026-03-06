@@ -48,6 +48,9 @@ from analytics.patterns import (
 )
 from analytics.archetype import ArchetypeAnalyzer
 from analytics.strategy_ranker import StrategyRankingEngine, ChannelMetrics
+from analytics.retention_diagnosis import RetentionDiagnosisEngine
+from analytics.video_diagnosis import VideoDiagnosisEngine
+from analytics.scope_guard import ScopeGuardLayer
 from services.video_resolver import resolve_video_by_title, get_top_matches, get_video_count, get_latest_video_from_db
 
 logger = logging.getLogger(__name__)
@@ -277,6 +280,33 @@ class ContextOrchestrator:
             memory_context=memory_context,
             available_tools=self.tool_registry.list_tools()
         )
+
+        # ──────────────────────────────────────────────
+        # PLANNER LOCK — Video Keyword Override
+        # Force video_analysis intent if message contains video keywords.
+        # Prevents planner misclassification → neutralizes scope leakage.
+        # ──────────────────────────────────────────────
+        _VIDEO_KEYWORDS = [
+            "last video", "my video", "analyze video", "analyze my",
+            "how did", "this upload", "last upload",
+            "latest video", "recent video", "my last",
+        ]
+        _msg_lower = message.lower()
+        if any(kw in _msg_lower for kw in _VIDEO_KEYWORDS):
+            if plan.intent_classification != "video_analysis":
+                logger.info(
+                    f"[PlannerLock] Overriding intent "
+                    f"'{plan.intent_classification}' → 'video_analysis' "
+                    f"(video keyword detected in message)"
+                )
+                plan.intent_classification = "video_analysis"
+                plan.tools_to_execute = []
+                plan.reasoning = {}
+                video_tools = ["fetch_last_video_analytics", "recall_context"]
+                available = self.tool_registry.list_tools()
+                for t in video_tools:
+                    if t in available:
+                        plan.add_tool(t, "Re-selected for video_analysis after planner lock")
 
         # Step 2a: Relative video reference detection
         # Handle "last video", "latest video", "my last upload" etc.
@@ -611,43 +641,208 @@ class ContextOrchestrator:
             except Exception as e:
                 logger.warning(f"[IdentityRoute] Archetype render failed, falling through to LLM: {e}")
 
-        # Step 4.6: Structural analysis intercept — deterministic archetype, no LLM
+        # Step 4.6: Structural analysis intercept — unified through StrategyRankingEngine
+        # NO SEPARATE RISK COMPUTATION. ALL risk goes through ONE engine.
         if plan.intent_classification == "structural_analysis" and channel_uuid:
-            logger.info("[StructuralRoute] Structural analysis detected — deterministic render")
+            logger.info("[StructuralRoute] Structural analysis detected — routing through StrategyRankingEngine")
             try:
                 archetype = self._compute_archetype(channel_uuid)
+                # Build ChannelMetrics from snapshot (same as strategy block)
+                retention_val = None
+                conversion_pct = None
+                shorts_pct = None
+                try:
+                    snapshot = self.postgres_store.get_latest_analytics_snapshot(channel_uuid)
+                    if snapshot:
+                        retention_val = snapshot.avg_view_percentage or None
+                        views = snapshot.views or 0
+                        subs = snapshot.subscribers_gained or 0
+                        if views > 0:
+                            conversion_pct = round((subs / views) * 100, 4)
+                except Exception:
+                    pass
+
+                metrics = ChannelMetrics(
+                    retention=retention_val,
+                    conversion=conversion_pct,
+                    shorts_ratio=shorts_pct,
+                    theme_concentration=80,
+                )
+                ranker = StrategyRankingEngine()
+                result = ranker.rank(metrics)
+
+                # Build response: archetype identity + strategy ranking
+                identity_block = ""
                 if archetype:
-                    structural_response = self._render_structural_response(archetype, message)
-                    # Store conversation
+                    identity_block = (
+                        f"**Channel Identity**\n\n"
+                        f"- **Format Type:** {archetype.format_type}\n"
+                        f"- **Theme Type:** {archetype.theme_type}\n"
+                        f"- **Growth Constraint:** {archetype.growth_constraint}\n"
+                        f"- **Performance Type:** {archetype.performance_type}\n\n"
+                    )
+
+                structural_response = (
+                    f"{identity_block}"
+                    f"## Strategy Ranking\n\n"
+                    f"{ranker.render(result)}"
+                )
+
+                logger.info(
+                    f"[StructuralRoute] Unified: Primary={result.primary_constraint}, "
+                    f"Severity={result.severity_score} — NO LLM call"
+                )
+
+                # Store conversation
+                await self._store_conversation(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    response=structural_response,
+                    tools_used=[]
+                )
+                self._persist_to_postgres(
+                    user_uuid=user_uuid,
+                    channel_uuid=channel_uuid,
+                    message=message,
+                    response=structural_response,
+                    tool_results=[],
+                    confidence=plan.confidence if hasattr(plan, "confidence") else None
+                )
+                metadata["usage"] = usage_metadata
+                return ExecuteResponse(
+                    success=True,
+                    content=structural_response,
+                    metadata={
+                        "intent": "structural_analysis",
+                        "confidence": 0.98,
+                        "deterministic": True,
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"[StructuralRoute] Strategy ranking failed, falling through to LLM: {e}")
+
+        # Step 4.7: Report/weekly summary intercept — fully deterministic, NO LLM
+        # HARD GUARDRAIL: report intent MUST NEVER reach the LLM.
+        if plan.intent_classification == "report":
+            logger.info("[ReportRoute] Report intent detected — deterministic only, NO LLM")
+            try:
+                from analytics.weekly_summary_generator import WeeklySummaryGenerator
+
+                snapshot = None
+                if channel_uuid:
+                    try:
+                        snapshot = self.postgres_store.get_latest_analytics_snapshot(channel_uuid)
+                    except Exception as snap_err:
+                        logger.warning(f"[ReportRoute] Snapshot fetch failed: {snap_err}")
+
+                if snapshot:
+                    analytics_data = {
+                        "avg_view_percentage": getattr(snapshot, "avg_view_percentage", None) or 0,
+                        "avg_watch_minutes": getattr(snapshot, "avg_watch_time_minutes", None) or 0,
+                        "avg_video_length_minutes": getattr(snapshot, "avg_video_length_minutes", 0) or 0,
+                        "shorts_ratio": getattr(snapshot, "shorts_ratio", 0) or 0,
+                        "ctr_percent": getattr(snapshot, "avg_ctr", None) or 0,
+                        "channel_avg_ctr": getattr(snapshot, "avg_ctr", None) or 0,
+                        "impressions": getattr(snapshot, "impressions", None) or 0,
+                        "views": getattr(snapshot, "views", None) or 0,
+                        "subscribers_gained": getattr(snapshot, "subscribers_gained", 0) or 0,
+                        "channel_avg_conversion_rate": 0,
+                        "total_views": getattr(snapshot, "views", None) or 0,
+                        "shorts_views": 0,
+                        "long_views": getattr(snapshot, "views", None) or 0,
+                        "shorts_avg_retention": 0,
+                        "long_avg_retention": getattr(snapshot, "avg_view_percentage", None) or 0,
+                        "current_period_views": getattr(snapshot, "views", None) or 0,
+                        "previous_period_views": getattr(snapshot, "previous_views", None) or getattr(snapshot, "views", 0) or 0,
+                        "current_period_subs": getattr(snapshot, "subscribers_gained", 0) or 0,
+                        "previous_period_subs": getattr(snapshot, "previous_subs", 0) or 0,
+                    }
+
+                    generator = WeeklySummaryGenerator()
+                    weekly_result = generator.generate(analytics_data)
+
+                    # Format deterministic response
+                    report_lines = [
+                        f"**Primary Constraint:** {weekly_result['primary_constraint']}",
+                        f"**Severity:** {weekly_result['primary_severity']}",
+                        f"**Risk Level:** {weekly_result['risk_level']}",
+                        f"**Confidence:** {weekly_result['confidence']}",
+                        "",
+                        "**Constraint Ranking:**",
+                    ]
+                    for constraint, sev in weekly_result["ranked_constraints"]:
+                        report_lines.append(f"- {constraint}: {sev}")
+
+                    if weekly_result.get("ranked_strategies"):
+                        report_lines.append("")
+                        report_lines.append("**Ranked Strategies:**")
+                        for i, strat in enumerate(weekly_result["ranked_strategies"], 1):
+                            name = strat.get("name", strat) if isinstance(strat, dict) else strat
+                            lift = strat.get("estimated_lift", "") if isinstance(strat, dict) else ""
+                            report_lines.append(f"{i}. {name}" + (f" (Lift: {lift})" if lift else ""))
+
+                    report_response = "\n".join(report_lines)
+                else:
+                    # No snapshot available — return structured error, NOT LLM
+                    report_response = (
+                        "**Weekly Summary**\n\n"
+                        "No analytics data available yet. "
+                        "Please connect your YouTube channel to generate a weekly summary."
+                    )
+
+                # Persist (best-effort — must never crash the response)
+                try:
                     await self._store_conversation(
                         user_id=user_id,
                         channel_id=channel_id,
                         message=message,
-                        response=structural_response,
+                        response=report_response,
                         tools_used=[]
                     )
                     self._persist_to_postgres(
                         user_uuid=user_uuid,
                         channel_uuid=channel_uuid,
                         message=message,
-                        response=structural_response,
+                        response=report_response,
                         tool_results=[],
                         confidence=plan.confidence if hasattr(plan, "confidence") else None
                     )
-                    metadata["usage"] = usage_metadata
-                    return ExecuteResponse(
-                        success=True,
-                        content=structural_response,
-                        metadata={
-                            "intent": "structural_analysis",
-                            "confidence": 0.98,
-                            "deterministic": True,
-                            "user_plan": user_plan,
-                            "usage": usage_metadata,
-                        }
-                    )
+                except Exception as persist_err:
+                    logger.warning(f"[ReportRoute] Persistence failed (non-fatal): {persist_err}")
+                metadata["usage"] = usage_metadata
+                return ExecuteResponse(
+                    success=True,
+                    content=report_response,
+                    metadata={
+                        "intent": "report",
+                        "confidence": 0.98,
+                        "deterministic": True,
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
             except Exception as e:
-                logger.warning(f"[StructuralRoute] Archetype render failed, falling through to LLM: {e}")
+                # Even on failure, return structured error — NEVER fall through to LLM
+                logger.error(f"[ReportRoute] WeeklySummaryGenerator failed: {e}")
+                metadata["usage"] = usage_metadata
+                return ExecuteResponse(
+                    success=True,
+                    content=(
+                        "**Weekly Summary**\n\n"
+                        "Unable to generate weekly summary at this time. "
+                        "Please try again shortly."
+                    ),
+                    metadata={
+                        "intent": "report",
+                        "confidence": 0.98,
+                        "deterministic": True,
+                        "user_plan": user_plan,
+                        "usage": usage_metadata,
+                    }
+                )
 
         # Step 5: Call LLM with full context (including historical)
         logger.debug("Calling LLM")
@@ -1222,6 +1417,108 @@ Shorts Ratio: {shorts_ratio}"""
         # Only inject for video_analysis — all other intents use structured context
         if plan.intent_classification == "video_analysis":
             video_analytics_section = self._build_video_analytics_prompt_section(tool_results)
+
+            # ──────────────────────────────────────────────
+            # LLM BYPASS — Video Diagnosis Engine
+            # ScopeGuard enforced: video scope validated before engine runs.
+            # ──────────────────────────────────────────────
+            scope_guard = ScopeGuardLayer()
+            try:
+                for tr in tool_results:
+                    logger.info(f"[VideoDiagnosisBypass] Checking tool: {tr.tool_name}, success={tr.success}, output_type={type(tr.output).__name__}")
+                    if tr.tool_name == "fetch_last_video_analytics" and tr.success:
+                        vdata = tr.output.get("data", {}) if isinstance(tr.output, dict) else {}
+                        logger.info(f"[VideoDiagnosisBypass] vdata keys: {list(vdata.keys()) if vdata else 'EMPTY'}, has_library={'library' in vdata if vdata else False}")
+                        if vdata and "library" not in vdata:
+                            v_title = vdata.get("title", "Unknown")
+                            v_views = vdata.get("views", 0)
+                            v_retention = vdata.get("avg_view_percentage", 0)
+                            v_watch_sec = vdata.get("avg_watch_time_seconds", 0)
+                            v_watch_min = v_watch_sec / 60.0 if v_watch_sec else 0
+                            v_duration_sec = vdata.get("duration_seconds", 0)
+                            v_duration_min = v_duration_sec / 60.0 if v_duration_sec else 0
+                            v_likes = vdata.get("likes", 0)
+                            v_comments = vdata.get("comments", 0)
+                            v_engagement = vdata.get("engagement_rate", 0)
+
+                            # Fallback 1: estimate retention from watch time / duration
+                            if not v_retention and v_watch_sec and v_duration_sec:
+                                v_retention = (v_watch_sec / v_duration_sec) * 100
+
+                            # Fallback 2: use channel-level retention from analytics snapshot
+                            if not v_retention:
+                                # Try all known key paths in analytics_context
+                                cp = analytics_context.get("current_period") or {}
+                                channel_retention = (
+                                    cp.get("avg_view_percentage")       # Primary: from _merge_tool_analytics
+                                    or cp.get("averageViewPercentage")  # Alt YouTube API key
+                                    or analytics_context.get("avg_view_pct")  # From archetype snapshot
+                                    or analytics_context.get("averageViewPercentage")
+                                    or 0
+                                )
+                                logger.info(
+                                    f"[VideoDiagnosisBypass] Fallback 2: "
+                                    f"current_period keys={list(cp.keys())[:8]}, "
+                                    f"channel_retention={channel_retention}"
+                                )
+                                if channel_retention:
+                                    v_retention = float(channel_retention)
+                                    logger.info(f"[VideoDiagnosisBypass] Using channel-level retention fallback: {v_retention}%")
+
+                            # Fallback for duration: default to 1 min if unknown
+                            if not v_duration_min:
+                                v_duration_min = 1.0
+
+                            logger.info(f"[VideoDiagnosisBypass] v_retention={v_retention}, v_duration_min={v_duration_min}, v_watch_sec={v_watch_sec}, v_duration_sec={v_duration_sec}")
+                            if v_retention > 0 and v_duration_min > 0:
+                                v_format = "short" if v_duration_min <= 1 else "long"
+                                # Scope guard: validate inputs before engine
+                                scope_data = {
+                                    "video_avg_view_percentage": min(v_retention, 100),
+                                    "video_watch_time_minutes": max(v_watch_min, 0),
+                                    "video_length_minutes": max(v_duration_min, 0.1),
+                                    "video_ctr": 0,
+                                    "impressions": 0,
+                                    "format_type": v_format,
+                                }
+                                scope_check = scope_guard.enforce("video_analysis", scope_data)
+                                if scope_check.get("status") != "ok":
+                                    logger.warning(f"[ScopeGuard] Video scope blocked: {scope_check}")
+                                    break
+
+                                vd_engine = VideoDiagnosisEngine()
+                                vd_result = vd_engine.diagnose(**scope_data)
+
+                                # Sanitize output — strip any non-video keys
+                                vd_result = scope_guard.sanitize_for_llm("video", vd_result)
+
+                                # Build direct response — no LLM
+                                direct = (
+                                    f"## Video Analysis: {v_title}\n\n"
+                                    f"**Performance Data**\n"
+                                    f"- Views: {v_views:,}\n"
+                                    f"- Avg View Percentage: {round(v_retention, 1)}%\n"
+                                    f"- Avg Watch Time: {round(v_watch_min, 1)} min\n"
+                                    f"- Duration: {round(v_duration_min, 1)} min\n"
+                                    f"- Likes: {v_likes:,}\n"
+                                    f"- Comments: {v_comments:,}\n"
+                                    f"- Engagement Rate: {round(v_engagement, 2)}%\n"
+                                    f"\n**Video Diagnosis (deterministic)**\n"
+                                    f"- Primary Constraint: {vd_result['primary_constraint']}\n"
+                                    f"- Severity: {vd_result['severity_score']}\n"
+                                    f"- Risk Vector: {', '.join(vd_result['risk_vector']) if vd_result['risk_vector'] else 'none'}\n"
+                                    f"- Format: {vd_result['format_type']}\n"
+                                    f"- Confidence: {vd_result['confidence']}\n"
+                                )
+
+                                logger.info(
+                                    f"[VideoDiagnosisBypass] constraint={vd_result['primary_constraint']}, "
+                                    f"severity={vd_result['severity_score']} — NO LLM call"
+                                )
+                                return direct
+                        break
+            except Exception as e:
+                logger.warning(f"[VideoDiagnosisBypass] Failed, falling back to LLM: {e}")
         else:
             video_analytics_section = ""
 
@@ -1258,7 +1555,8 @@ Shorts Ratio: {shorts_ratio}"""
         # Build archetype context for strategy intents (Phase 1.5)
         archetype_section = ""
         strategy_ranking_section = ""
-        if plan.intent_classification in ("insight", "analytics", "general") and channel_uuid:
+        retention_diagnosis_section = ""
+        if plan.intent_classification in ("insight", "analytics", "structural_analysis") and channel_uuid:
             try:
                 archetype = self._compute_archetype(channel_uuid)
                 if archetype:
@@ -1271,12 +1569,11 @@ Shorts Ratio: {shorts_ratio}"""
                     elif archetype.growth_constraint == "Momentum-Declining":
                         primary_focus = "Momentum Recovery"
 
-                    archetype_section = f"""## ARCHETYPE CONTEXT (pre-computed — use directly, do not contradict)
+                    archetype_section = f"""## Channel Context (pre-computed diagnostics)
 
-GROWTH_CONSTRAINT_LOCK: {archetype.growth_constraint}
-You MUST treat this as the primary bottleneck.
-Do NOT override it based on other metrics.
-Do NOT reclassify the channel.
+Primary Growth Constraint: {archetype.growth_constraint}
+This is the primary bottleneck identified by the diagnostics layer.
+Base your response on this constraint.
 
 Channel Identity:
 - Format Type: {archetype.format_type}
@@ -1285,46 +1582,32 @@ Channel Identity:
 - Performance Type: {archetype.performance_type}
 - Primary Focus: {primary_focus}
 
-STRATEGY ADAPTATION RULES:
+Strategy Guidance:
 
 1. If Growth Constraint = Retention-Constrained:
-   → Lead with hook engineering and pacing optimization.
-   → Do NOT suggest distribution scaling first.
+   Lead with hook engineering and pacing optimization.
 
 2. If Growth Constraint = Conversion-Constrained:
-   → Focus on CTA, subscriber psychology, loyalty mechanics.
+   Focus on CTA, subscriber psychology, loyalty mechanics.
 
 3. If Theme Type = Theme-Concentrated:
-   → Warn about creative fragility.
-   → Suggest controlled thematic expansion.
+   Note creative fragility and suggest controlled thematic expansion.
 
 4. If Format Type contains Dominant:
-   → Recommend diversification testing.
-   → Warn about algorithmic dependency risk.
+   Suggest diversification testing.
 
 5. If Performance Type = Underperforming Library:
-   → Focus on packaging, topic-market mismatch, title/thumbnail testing.
+   Focus on packaging, topic-market mismatch, title/thumbnail testing.
 
 6. If Performance Type = Stable Library:
-   → Recommend scaling winning pattern, not pivoting.
+   Recommend scaling winning patterns.
 
-MANDATORY OPENING LINE:
-Strategy output MUST begin with:
-"As a {archetype.theme_type}, {archetype.growth_constraint} channel..."
+Constraint Priority (from diagnostics layer):
+1. Retention (affects distribution)
+2. Conversion (affects scaling)
+3. Momentum (affects trajectory)
 
-CLASSIFICATION AUTHORITY:
-- You are NOT allowed to re-evaluate growth constraint.
-- You MUST use GROWTH_CONSTRAINT_LOCK as authoritative.
-- Even if other metrics appear more relevant, do NOT switch bottleneck.
-- The constraint was computed by the diagnostics layer and is final.
-- Do not give generic YouTube advice.
-- Primary Focus MUST be: {primary_focus}
-
-Constraint Priority Hierarchy (system-level, non-negotiable):
-1. Retention (affects distribution — highest priority)
-2. Conversion (affects scaling — second priority)
-3. Momentum (affects trajectory — third priority)
-Never invert this order. Never reclassify."""
+Primary Focus: {primary_focus}"""
                     plan.parameters["growth_constraint"] = archetype.growth_constraint
                     plan.parameters["archetype"] = {
                         "format_type": archetype.format_type,
@@ -1371,6 +1654,48 @@ Never invert this order. Never reclassify."""
                     except Exception as e:
                         logger.warning(f"[StrategyRanker] Failed: {e}")
                         strategy_ranking_section = ""
+
+                    # Compute deterministic retention diagnosis
+                    retention_diagnosis_section = ""
+                    try:
+                        if retention_val is not None and retention_val > 0:
+                            # Get watch time and video length from snapshot
+                            avg_watch_minutes = 0.0
+                            avg_video_length = 0.0
+                            shorts_ratio_decimal = 0.0
+
+                            try:
+                                if snapshot:
+                                    avg_duration_sec = snapshot.average_view_duration or 0
+                                    avg_watch_minutes = avg_duration_sec / 60.0
+                                    # Estimate avg video length from watch time and retention
+                                    if retention_val > 0:
+                                        avg_video_length = (avg_watch_minutes / (retention_val / 100.0))
+                                    # Shorts ratio as decimal (0-1)
+                                    if shorts_pct is not None:
+                                        shorts_ratio_decimal = shorts_pct / 100.0
+                            except Exception:
+                                pass
+
+                            diag_engine = RetentionDiagnosisEngine()
+                            diagnosis = diag_engine.diagnose(
+                                avg_view_percentage=retention_val,
+                                avg_watch_time_minutes=avg_watch_minutes,
+                                avg_video_length_minutes=max(avg_video_length, 0),
+                                shorts_ratio=min(shorts_ratio_decimal, 1.0),
+                                long_form_ratio=max(0, 1.0 - min(shorts_ratio_decimal, 1.0)),
+                            )
+                            retention_diagnosis_section = (
+                                f"Retention Diagnosis:\n"
+                                f"- Severity: {diagnosis['severity_score']}\n"
+                                f"- Risk Level: {diagnosis['risk_level']}\n"
+                                f"- Shorts Ratio: {diagnosis['amplifiers']['shorts_ratio']}\n"
+                                f"- Watch Time Ratio: {diagnosis['amplifiers']['watch_time_ratio']}\n"
+                                f"- Confidence: {diagnosis['confidence']}"
+                            )
+                            logger.info(f"[RetentionDiagnosis] severity={diagnosis['severity_score']}, risk={diagnosis['risk_level']}")
+                    except Exception as e:
+                        logger.warning(f"[RetentionDiagnosis] Failed: {e}")
             except Exception as e:
                 logger.warning(f"[ArchetypeRoute] Failed to build archetype section: {e}")
 
@@ -1394,6 +1719,64 @@ Never invert this order. Never reclassify."""
                 f"- Growth vs previous 7 days: {'+' if tv_growth > 0 else ''}{tv_growth}%\n"
             )
 
+            # Compute deterministic video diagnosis
+            video_diagnosis_block = ""
+            try:
+                tv_retention = top_video_meta.get("avg_view_percentage", 0)
+                tv_watch_time = top_video_meta.get("watch_time_minutes", 0)
+                tv_length = top_video_meta.get("video_length_minutes", 0)
+                tv_ctr = top_video_meta.get("ctr", 0)
+                tv_impressions = top_video_meta.get("impressions", 0)
+                tv_format = "short" if tv_length and tv_length <= 1 else "long"
+
+                if tv_retention and tv_length and tv_length > 0:
+                    vd_engine = VideoDiagnosisEngine()
+                    vd_result = vd_engine.diagnose(
+                        video_avg_view_percentage=tv_retention,
+                        video_watch_time_minutes=max(tv_watch_time, 0),
+                        video_length_minutes=max(tv_length, 0.1),
+                        video_ctr=max(tv_ctr, 0),
+                        impressions=max(int(tv_impressions), 0),
+                        format_type=tv_format,
+                    )
+                    video_diagnosis_block = (
+                        f"\nVideo Diagnosis (deterministic):\n"
+                        f"- Primary Constraint: {vd_result['primary_constraint']}\n"
+                        f"- Severity: {vd_result['severity_score']}\n"
+                        f"- Risk Vector: {', '.join(vd_result['risk_vector']) if vd_result['risk_vector'] else 'none'}\n"
+                        f"- Format: {vd_result['format_type']}\n"
+                        f"- Confidence: {vd_result['confidence']}\n"
+                    )
+                    logger.info(f"[VideoDiagnosis] constraint={vd_result['primary_constraint']}, severity={vd_result['severity_score']}")
+            except Exception as e:
+                logger.warning(f"[VideoDiagnosis] Failed: {e}")
+
+            # ──────────────────────────────────────────────
+            # LLM BYPASS — Video Diagnosis Engine
+            # If we have a pre-computed video diagnosis, return directly. No LLM.
+            # ──────────────────────────────────────────────
+            if video_diagnosis_block:
+                direct_response = (
+                    f"## Video Analysis: {tv_title}\n\n"
+                    f"**Performance Data (last 7 days)**\n"
+                    f"- Views: {tv_views:,}\n"
+                    f"- Growth vs previous 7 days: {'+' if tv_growth > 0 else ''}{tv_growth}%\n"
+                )
+
+                # Add available metrics
+                if tv_retention:
+                    direct_response += f"- Avg View Percentage: {round(tv_retention, 1)}%\n"
+                if tv_ctr:
+                    direct_response += f"- CTR: {round(tv_ctr, 1)}%\n"
+                if tv_impressions:
+                    direct_response += f"- Impressions: {int(tv_impressions):,}\n"
+
+                direct_response += f"\n{video_diagnosis_block}"
+
+                logger.info(f"[VideoDiagnosisBypass] Returning pre-computed video diagnosis directly — NO LLM call")
+                return direct_response
+
+            # Fallback: if diagnosis couldn't be computed, use LLM
             instructions_block = (
                 "Instructions:\n"
                 "- Follow the top video analysis template EXACTLY\n"
@@ -1401,7 +1784,9 @@ Never invert this order. Never reclassify."""
                 "- Do NOT mention video IDs or internal metadata\n"
                 "- Do NOT echo the user's prompt back to them\n"
                 "- Do NOT use markdown tables or raw JSON\n"
-                "- Do NOT compare to channel-wide stats"
+                "- Do NOT compare to channel-wide stats\n"
+                "- Do NOT generate strategy suggestions\n"
+                "- Keep response under 150 words"
             )
 
             full_prompt = f"""
@@ -1516,21 +1901,21 @@ Format Bias:
 Shorts Median Views: <copy from PATTERN INTELLIGENCE>
 Standard Median Views: <copy from PATTERN INTELLIGENCE>
 
-[PATTERN INTELLIGENCE — STRICT RULES]
-- You MUST use Pattern Intelligence section exactly as provided.
-- You are NOT allowed to invent themes.
-- Do NOT provide emotional reasoning.
-- Do NOT give content ideas unless explicitly requested.
-- Do NOT add Diagnostics or Strategy sections.
-- Do NOT recompute themes or format biases.
-- Do NOT use emojis.
+[PATTERN INTELLIGENCE — RULES]
+- Use the Pattern Intelligence section exactly as provided.
+- Do not invent themes.
+- Do not provide emotional reasoning.
+- Do not give content ideas unless explicitly requested.
+- Do not add Diagnostics or Strategy sections.
+- Do not recompute themes or format biases.
+- Do not use emojis.
 - Keep professional tone.
 - Keep concise.
 - No summary paragraph. No closing question. No call-to-action.
-- End after the Pattern Intelligence section. Do NOT add anything after it.
+- End after the Pattern Intelligence section. Do not add anything after it.
 
-[STRICTLY FORBIDDEN]
-You MUST NOT:
+[OUTPUT BOUNDARIES]
+Do not:
 - Hallucinate themes or format biases not in the data
 - Add motivational language or encouragement
 - Use phrases: "you should", "consider doing", "to improve", "I recommend"
@@ -1585,11 +1970,11 @@ Format Bias:
 Shorts Median Views: <copy from PATTERN INTELLIGENCE>
 Standard Median Views: <copy from PATTERN INTELLIGENCE>
 
-[TONE — MANDATORY]
-- Use neutral, product-grade vocabulary ONLY: "indicates", "suggests", "signals", "reflects", "positions the video"
-- Do NOT use emotional or dramatic language: "significant disconnect", "risks being overlooked", "challenging landscape", "critical", "compounds the issue", "unfortunately", "struggles"
-- Do NOT use subjective adjectives: "impressive", "concerning", "disappointing", "remarkable"
-- Do NOT repeat the percentile explanation more than once
+[TONE GUIDELINES]
+- Use neutral, product-grade vocabulary: "indicates", "suggests", "signals", "reflects", "positions the video"
+- Do not use emotional or dramatic language: "significant disconnect", "risks being overlooked", "challenging landscape", "critical", "compounds the issue", "unfortunately", "struggles"
+- Do not use subjective adjectives: "impressive", "concerning", "disappointing", "remarkable"
+- Do not repeat the percentile explanation more than once
 - Tone: SaaS analytics product — clean, neutral, factual
 
 [SCOPE ISOLATION — STRATEGY ENGINE]
@@ -1605,14 +1990,14 @@ Standard Median Views: <copy from PATTERN INTELLIGENCE>
 - Always include ALL five diagnostic fields in the exact order shown.
 - Copy diagnostic and strategy values WORD FOR WORD from the provided sections.
 - Do NOT invert percentile values. If diagnostics say "outperformed 0%", write "outperformed 0%" — NEVER restate as "top 100%".
-- Do NOT recompute any fields from raw numbers.
-- If a field is Unknown, state it is unavailable — do NOT infer or estimate.
+- Do not recompute any fields from raw numbers.
+- If a field is Unknown, state it is unavailable — do not infer or estimate.
 - No emoji. No markdown tables. No raw JSON.
 - No summary paragraph. No closing question. No call-to-action.
-- End after the Pattern Intelligence section. Do NOT add anything after it.
+- End after the Pattern Intelligence section. Do not add anything after it.
 
-[STRICTLY FORBIDDEN]
-You MUST NOT:
+[OUTPUT BOUNDARIES]
+Do not:
 - Hallucinate CTR, subscriber totals, or view counts not in the diagnostics
 - Mix channel-level analytics into video-level analysis
 - Recompute or invent missing themes or format biases
@@ -1680,10 +2065,15 @@ Forbidden in channel-level responses:
             # Only bypass for strategy-relevant queries (not video_analysis, not content_strategy)
             is_strategy_bypass = (
                 is_growth_query
-                or plan.intent_classification in ("insight", "analytics", "general")
+                or plan.intent_classification in ("insight", "analytics")
             ) and not is_content_strategy
 
             if is_strategy_bypass:
+                # Scope guard: enforce channel scope before strategy rendering
+                sg = ScopeGuardLayer()
+                sg_scope = sg.determine_scope(plan.intent_classification)
+                if sg_scope != "channel":
+                    logger.warning(f"[ScopeGuard] Strategy bypass blocked: scope={sg_scope} (expected channel)")
                 # Build direct output — no LLM
                 archetype_opening = ""
                 if archetype_section and hasattr(self, '_last_archetype'):
@@ -1693,8 +2083,13 @@ Forbidden in channel-level responses:
                         f"{a.get('growth_constraint', 'Retention-Constrained')} channel:\n\n"
                     )
 
-                direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}"
-                logger.info(f"[StrategyBypass] Returning pre-computed ranking directly — NO LLM call")
+                # Append retention diagnosis if available
+                diag_block = ""
+                if retention_diagnosis_section:
+                    diag_block = f"\n\n{retention_diagnosis_section}"
+
+                direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}{diag_block}"
+                logger.info(f"[StrategyBypass] Returning pre-computed ranking + diagnosis directly — NO LLM call")
                 return direct_response
 
         # ──────────────────────────────────────────────
@@ -1717,6 +2112,8 @@ Forbidden in channel-level responses:
 {archetype_section}
 
 {strategy_ranking_section}
+
+{retention_diagnosis_section}
 
 {video_library_section}
 

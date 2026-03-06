@@ -66,6 +66,7 @@ class LangChainAzureClient:
             Generated text response
         """
         try:
+            logger.info("LLM invocation using provider=azure_openai")
             messages = [HumanMessage(content=prompt)]
             response = self.llm.invoke(messages)
 
@@ -93,7 +94,6 @@ class LangChainAzureClient:
             return str(content) if content else ""
 
         except Exception as e:
-            error_msg = str(e).lower()
             logger.warning(
                 f"Azure OpenAI failed ({type(e).__name__}), attempting Gemini fallback: {e}"
             )

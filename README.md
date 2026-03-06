@@ -56,6 +56,32 @@ The **Model Context Protocol** is an architectural pattern for building robust A
 └─────────────────┘
 ```
 
+### Deterministic Engine Pipeline
+
+```
+Analytics Data
+     │
+     ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  Deterministic Engines (No LLM)                  │
+│                                                                  │
+│  RetentionDiagnosis ─┐                                          │
+│  CTRDiagnosis ───────┤                                          │
+│  ConversionRate ─────┼──▶ UnifiedEngineOrchestrator             │
+│  ShortsImpact ───────┤        │                                 │
+│  GrowthTrend ────────┤        ├──▶ StrategyRanker               │
+│  ThumbnailScoring ───┤        └──▶ NextVideoBlueprintEngine     │
+│  ThumbnailQuality ───┘                                          │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+     │
+     ▼
+Primary Constraint + Severity + Ranked Strategies + Blueprint
+     │
+     ▼
+Narrator (system.txt) ──▶ Creator-Friendly Response
+```
+
 ## Mobile-First Features
 
 - **Mobile-Optimized API**: Single `/execute` endpoint reduces network chattiness and latency for mobile clients
@@ -63,6 +89,9 @@ The **Model Context Protocol** is an architectural pattern for building robust A
 - **Plan-Based Access Control**: Fully integrated FREE/PRO usage limits (3 requests/day for FREE) with server-side validation
 - **Advanced Video Diagnostics (Phase 1.1)**: Pure-Python deterministic diagnostic engine that extracts 5 structured health fields (Performance Tier, Percentile Rank, Retention Category, Momentum, Format) before invoking the LLM
 - **Strategy Ranking Engine (Phase 1.6)**: Deterministic Python module that mathematically ranks growth strategies based on constraint severity — completely bypasses LLM for strategy queries, producing zero-drift ranked output
+- **Thumbnail Quality Engine**: Deterministic CTR-based packaging diagnosis (CTR < 3% → critical, 3–6% → moderate, > 6% → strong)
+- **Next Video Blueprint Engine**: Constraint-to-action translator that generates structured upload guidance (direction, opening approach, content structure, creator action) without LLM
+- **Unified Engine Orchestrator**: Aggregates all 7 diagnostic engines, selects primary constraint, ranks all constraints by severity, and auto-generates next-upload blueprint
 - **Archetype Classification**: Automatic channel archetype detection (Theme Type, Growth Constraint, Format Type, Performance Type) for constraint-first strategy recommendations
 - **UX-Grade AI Responses**: Enforced strict SaaS analytics formatting (structured health overview + 2-paragraph cohesive narrative) preventing generic, hallucinated, or subjective AI advice
 - **Extended Analytics**: Fast retrieval of CTR, impressions, retention, and traffic source metrics explicitly formatted for mobile charts
@@ -156,7 +185,13 @@ creatorpilot-mcp/
 │   ├── fetcher.py         # Fetch data from YouTube Analytics API
 │   ├── normalizer.py      # Normalize API responses to snapshot format
 │   ├── archetype.py       # Channel archetype classification engine
-│   └── strategy_ranker.py # Deterministic strategy ranking engine (Phase 1.6)
+│   ├── strategy_ranker.py # Deterministic strategy ranking engine (Phase 1.6)
+│   ├── retention_diagnosis.py           # Retention constraint diagnosis
+│   ├── thumbnail_scoring.py             # CTR-based thumbnail/packaging scorer
+│   ├── thumbnail_quality_engine.py      # Packaging quality from impressions/views
+│   ├── unified_engine_orchestrator.py   # Aggregates all engines, selects primary constraint
+│   ├── next_video_blueprint_engine.py   # Constraint → next-upload guidance (no LLM)
+│   └── premium_formatter.py             # LLM response formatting (max_tokens=800)
 │
 ├── db/                    # Database models and session management
 │   ├── __init__.py        # Package exports
@@ -180,16 +215,20 @@ creatorpilot-mcp/
 ├── scripts/               # Utility scripts
 │   └── init_db.py         # Database initialization script
 │
-├── tests/                 # Test suite (460 tests)
+├── tests/                 # Test suite (916 tests)
 │   ├── conftest.py        # Shared fixtures
 │   ├── test_server.py     # Server endpoint tests
 │   ├── test_orchestrator.py  # Orchestrator integration tests
 │   ├── test_planner.py    # Intent classification tests
 │   ├── test_response_quality.py  # Response quality assertions
-│   └── test_strategy_ranker.py   # Strategy ranking engine tests (29 tests)
+│   ├── test_strategy_ranker.py   # Strategy ranking engine tests
+│   ├── test_thumbnail_scoring.py # Thumbnail scoring module tests
+│   ├── test_thumbnail_quality_engine.py  # Thumbnail quality engine tests
+│   ├── test_unified_engine_orchestrator.py  # Unified orchestrator tests
+│   └── test_next_video_blueprint_engine.py  # Next video blueprint tests
 │
 └── prompts/               # LLM prompt templates
-    ├── system.txt         # Core system prompt
+    ├── system.txt         # Core system prompt (Azure-compliant, positive framing)
     ├── analysis.txt       # Deep analysis mode prompt
     └── top_video_analysis.txt  # Top video analysis template
 ```
@@ -1223,6 +1262,17 @@ TOOL_REQUIREMENTS: dict[str, str] = {
 Extend the `_invoke_llm` method in `executor/execute.py` to support additional providers.
 
 ## Recent Updates
+
+### v1.5.0 — Deterministic Engine Pipeline & Narration Overhaul
+- **ThumbnailScoringModule**: Deterministic packaging diagnosis from CTR (< 3% → critical, 3–6% → moderate, > 6% → strong). No LLM.
+- **ThumbnailQualityEngine**: Computes CTR internally from impressions/views, produces packaging_score, quality, risk_level.
+- **NextVideoBlueprintEngine**: Maps primary constraint to structured next-upload guidance (direction, opening, structure, creator action). No LLM.
+- **UnifiedEngineOrchestrator**: Aggregates 7 engines, selects primary constraint, ranks by severity, auto-generates blueprint.
+- **PremiumOutputFormatter**: Increased `max_tokens` from 400 → 800 to prevent truncated responses.
+- **System Prompt Overhaul**: Complete rewrite of `system.txt` using positive framing to avoid Azure content filter jailbreak detection. Added STRATEGY SCOPE, METRIC EXPOSURE CONTROL, CLASSIFICATION PRIVACY, and ACTIONABLE STRATEGY TRANSLATION sections.
+- **Archetype Injection Hardening**: Removed aggressive language (MANDATORY, STRICTLY FORBIDDEN, MUST NOT) from execute.py archetype/pattern/video instruction blocks.
+- **executor.py Bug Fix**: Replaced non-existent `_persist_to_redis` with `_store_conversation`, wrapped persistence in try/except.
+- **Test Suite**: Expanded to 916 tests (from 875).
 
 ### v1.4.0 — Pattern Intelligence & Intent Engine
 - **Semantic Topic Clustering**: Upgraded video clustering from single-token anchors to human-readable semantic categories (e.g., "playground adventure", "travel vlog") with secondary keyword fallbacks.

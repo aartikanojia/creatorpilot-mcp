@@ -4,9 +4,9 @@
 # =============================================================================
 
 # Web Framework
-fastapi>=0.129.0                # High-performance async web framework
-uvicorn[standard]>=0.40.0       # ASGI server for FastAPI
-pydantic>=2.12.5                # Data validation and serialization
+fastapi>=0.129.0,<1.0           # High-performance async web framework
+uvicorn[standard]>=0.40.0,<1.0  # ASGI server for FastAPI
+pydantic>=2.12.5,<2.13          # Data validation and serialization (capped to avoid pydantic-core build issues)
 
 # Database
 asyncpg>=0.31.0                 # Async PostgreSQL driver for SQLAlchemy
@@ -16,14 +16,15 @@ alembic>=1.18.4                 # Database migration tool for SQLAlchemy
 psycopg2-binary>=2.9.11         # PostgreSQL adapter (sync, for Alembic)
 
 # HTTP Client
-httpx>=0.28.1                   # Modern async HTTP client for LLM API calls
-google-generativeai>=0.8.6      # Google Gemini Python SDK
-langchain>=1.2.10               # LangChain framework
-langchain-core>=1.2.13          # Core LangChain abstractions
-langchain-community>=0.4.1      # Community integrations
-langchain-google-genai>=4.2.0   # Google Gemini for LangChain
-langchain-openai>=1.1.9         # Azure OpenAI for LangChain
-aiohttp>=3.13.3                 # Async HTTP client/server framework
+httpx>=0.28.1,<1.0              # Modern async HTTP client for LLM API calls
+google-generativeai>=0.8.6,<1.0 # Google Gemini Python SDK
+langchain>=1.2.10,<2.0          # LangChain framework
+langchain-core>=1.2.13,<2.0     # Core LangChain abstractions
+langchain-community>=0.4.1,<1.0 # Community integrations
+dataclasses-json>=0.6.7,<0.7    # JSON serialization (required by langchain-community)
+langchain-google-genai>=4.2.0,<5.0  # Google Gemini for LangChain
+langchain-openai>=1.1.9,<2.0    # Azure OpenAI for LangChain
+aiohttp>=3.13.3,<4.0            # Async HTTP client/server framework
 
 # Configuration
 python-dotenv>=1.2.1            # Load environment variables from .env file

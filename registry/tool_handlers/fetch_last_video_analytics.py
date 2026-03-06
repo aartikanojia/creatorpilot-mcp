@@ -278,7 +278,7 @@ class YouTubeVideoFetcher:
         
         # Step 3: Get full video details including statistics
         videos_response = service.videos().list(
-            part="snippet,statistics",
+            part="snippet,statistics,contentDetails",
             id=video_id
         ).execute()
         
@@ -290,13 +290,21 @@ class YouTubeVideoFetcher:
         snippet = video["snippet"]
         statistics = video.get("statistics", {})
         
+        # Parse duration from contentDetails
+        duration_seconds = 0
+        content_details = video.get("contentDetails", {})
+        raw_duration = content_details.get("duration", "")
+        if raw_duration:
+            duration_seconds = self._parse_iso_duration(raw_duration)
+        
         return {
             "video_id": video_id,
             "title": snippet.get("title", "Untitled"),
             "published_at": snippet.get("publishedAt"),
             "views": int(statistics.get("viewCount", 0)),
             "likes": int(statistics.get("likeCount", 0)),
-            "comments": int(statistics.get("commentCount", 0))
+            "comments": int(statistics.get("commentCount", 0)),
+            "duration_seconds": duration_seconds,
         }
     
     def get_video_analytics(self, video_id: str) -> dict[str, Any]:
@@ -326,17 +334,18 @@ class YouTubeVideoFetcher:
                 ids="channel==MINE",
                 startDate=start_date.strftime("%Y-%m-%d"),
                 endDate=end_date.strftime("%Y-%m-%d"),
-                metrics="views,averageViewDuration,estimatedMinutesWatched",
+                metrics="views,averageViewDuration,estimatedMinutesWatched,averageViewPercentage",
                 filters=f"video=={video_id}"
             ).execute()
             
             rows = response.get("rows", [])
             if rows:
-                # Metrics order: views, averageViewDuration, estimatedMinutesWatched
+                # Metrics order: views, averageViewDuration, estimatedMinutesWatched, averageViewPercentage
                 return {
                     "views": int(rows[0][0]) if len(rows[0]) > 0 else 0,
                     "avg_view_duration_seconds": float(rows[0][1]) if len(rows[0]) > 1 else 0,
-                    "watch_time_minutes": float(rows[0][2]) if len(rows[0]) > 2 else 0
+                    "watch_time_minutes": float(rows[0][2]) if len(rows[0]) > 2 else 0,
+                    "avg_view_percentage": float(rows[0][3]) if len(rows[0]) > 3 else 0,
                 }
             
         except HttpError as e:
@@ -464,12 +473,19 @@ async def handle_fetch_last_video_analytics(input_data: dict[str, Any]) -> dict[
         avg_watch_time_seconds = analytics.get("avg_view_duration_seconds", 0)
         
         # Step 4: Build normalized output
+        avg_view_percentage = analytics.get("avg_view_percentage", 0)
+        watch_time_minutes = analytics.get("watch_time_minutes", 0)
+        duration_sec = video.get("duration_seconds", 0)
+
         normalized_data = {
             "video_id": video_id,
             "title": title,
             "published_at": video["published_at"],
             "views": views,
             "avg_watch_time_seconds": round(avg_watch_time_seconds, 2),
+            "avg_view_percentage": round(avg_view_percentage, 2),
+            "watch_time_minutes": round(watch_time_minutes, 2),
+            "duration_seconds": duration_sec,
             "engagement_rate": round(engagement_rate, 2),
             # Additional metrics for richer context
             "likes": likes,
