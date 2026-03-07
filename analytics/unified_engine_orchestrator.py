@@ -35,10 +35,14 @@ class UnifiedEngineOrchestrator:
     - ShortsImpactAnalyzer
     - GrowthTrendExplanationEngine
     - ThumbnailScoringModule (optional)
+    - NextVideoBlueprintEngine
 
     Produces ONE primary constraint and ONE severity for ALL queries.
     No strategy. No LLM. No narrative.
     """
+
+    def __init__(self):
+        self.next_video_engine = NextVideoBlueprintEngine()
 
     def orchestrate(
         self,
@@ -109,8 +113,7 @@ class UnifiedEngineOrchestrator:
 
         # ── 6. Next Video Blueprint ──
 
-        blueprint_engine = NextVideoBlueprintEngine()
-        next_video_blueprint = blueprint_engine.generate(primary_constraint)
+        next_video_blueprint = self.next_video_engine.generate(primary_constraint)
 
         result = {
             "primary_constraint": primary_constraint,

@@ -57,6 +57,21 @@ class VideoDiagnosisEngine:
             format_type,
         )
 
+        # Cold-start guard — insufficient data for meaningful diagnosis
+        if impressions < 10:
+            logger.info(
+                f"[VideoDiagnosis] Cold-start guard: impressions={impressions} < 10, skipping diagnosis"
+            )
+            return {
+                "scope": "video",
+                "primary_constraint": "insufficient_data",
+                "severity_score": 0.0,
+                "risk_vector": [],
+                "format_type": format_type,
+                "confidence": 0.0,
+                "message": "This video has not received enough views yet to evaluate performance.",
+            }
+
         retention_severity = self._retention_severity(video_avg_view_percentage)
         ctr_severity = self._ctr_severity(video_ctr)
         distribution_severity = self._distribution_severity(impressions)

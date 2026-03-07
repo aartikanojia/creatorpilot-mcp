@@ -41,7 +41,7 @@ class TestFormatterStructure:
 
     def test_contains_primary_constraint(self, formatter):
         r = formatter.format(_full_state())
-        assert "Primary Constraint: retention" in r
+        assert "Primary Constraint: Viewers Leaving Early" in r
 
     def test_contains_severity(self, formatter):
         r = formatter.format(_full_state())
@@ -49,7 +49,8 @@ class TestFormatterStructure:
 
     def test_contains_risk_level(self, formatter):
         r = formatter.format(_full_state())
-        assert "Risk Level: critical" in r
+        # Risk Level removed from creator-facing output
+        assert "Risk Level" not in r
 
     def test_contains_strategies(self, formatter):
         r = formatter.format(_full_state())
@@ -70,7 +71,8 @@ class TestFormatterStrictFiltering:
             emoji="🔥",
         )
         r = formatter.format(state)
-        assert "My Video" not in r
+        # video_title is now an allowed (optional) key — it SHOULD appear
+        assert "My Video" in r
         assert "Some desc" not in r
         assert "5000" not in r
         assert "🔥" not in r
@@ -296,6 +298,5 @@ class TestRouter:
 class TestNoNarrative:
     def test_formatter_no_advice(self, formatter):
         r = formatter.format(_full_state())
-        for phrase in ["you should", "consider", "recommend",
-                       "thumbnail"]:
+        for phrase in ["you should", "consider", "recommend"]:
             assert phrase not in r.lower()

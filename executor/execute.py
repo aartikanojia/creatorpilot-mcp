@@ -81,6 +81,33 @@ class ContextOrchestrator:
         r"\bchannel archetype\b",
     ]
 
+    # Conversational patterns — answer naturally without analytics
+    CONVERSATIONAL_NAME_PATTERNS = [
+        r"\bwhat(?:'s| is) my name\b",
+        r"\bwhat(?:'s| is) my channel name\b",
+        r"\bwho am i\b",
+        r"\bmy channel name\b",
+        r"\bwhat(?:'s| is) my channel called\b",
+    ]
+
+    @staticmethod
+    def severity_label(score) -> str:
+        """Translate numeric severity (0.0–1.0) to a creator-friendly label."""
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            return str(score)
+        if score >= 0.9:
+            return "Critical"
+        elif score >= 0.7:
+            return "High"
+        elif score >= 0.5:
+            return "Moderate"
+        elif score >= 0.3:
+            return "Early Warning"
+        else:
+            return "Stable"
+
     def __init__(self) -> None:
         """Initialize orchestrator with all required components."""
         self.planner = ExecutionPlanner()
@@ -604,7 +631,45 @@ class ContextOrchestrator:
                 approved_tools, message, memory_context, plan.parameters
             )
 
-        # Step 4.5: Identity intercept — deterministic archetype, no LLM
+        # Step 4.5a: Conversational name query intercept — no analytics needed
+        if self._is_conversational_name_query(message):
+            logger.info("[ConversationalRoute] Name query detected — no analytics")
+
+            # Try to retrieve channel name from loaded context
+            _ch = memory_context.get("channel", {}) or {}
+            _ch_name = _ch.get("channel_name") if isinstance(_ch, dict) else None
+
+            if _ch_name:
+                response = f"Your channel name is **{_ch_name}**."
+            else:
+                response = (
+                    "I don't have your channel name yet. "
+                    "Please connect your YouTube channel so I can access your profile."
+                )
+
+            try:
+                await self._store_conversation(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    message=message,
+                    response=response,
+                    tools_used=[]
+                )
+            except Exception:
+                pass
+            return ExecuteResponse(
+                success=True,
+                content=response,
+                metadata={
+                    "intent": "conversational",
+                    "confidence": 1.0,
+                    "deterministic": True,
+                    "user_plan": user_plan,
+                    "usage": usage_metadata,
+                }
+            )
+
+        # Step 4.5b: Identity intercept — deterministic archetype, no LLM
         if channel_uuid and self._is_identity_query(message):
             logger.info("[IdentityRoute] Identity query detected — deterministic render")
             try:
@@ -764,17 +829,25 @@ class ContextOrchestrator:
                     generator = WeeklySummaryGenerator()
                     weekly_result = generator.generate(analytics_data)
 
+                    # Constraint display translations
+                    _ct = {
+                        "ctr": "Low Click Attraction", "retention": "Viewers Leaving Early",
+                        "conversion": "Low Subscriber Conversion", "shorts": "Shorts Dependency",
+                        "growth": "Growth Slowdown",
+                    }
+                    _raw_pc = weekly_result['primary_constraint']
+                    _display_pc = _ct.get(_raw_pc, _raw_pc)
+
                     # Format deterministic response
                     report_lines = [
-                        f"**Primary Constraint:** {weekly_result['primary_constraint']}",
-                        f"**Severity:** {weekly_result['primary_severity']}",
-                        f"**Risk Level:** {weekly_result['risk_level']}",
+                        f"**Primary Constraint:** {_display_pc}",
+                        f"**Severity:** {self.severity_label(weekly_result['primary_severity'])}",
                         f"**Confidence:** {weekly_result['confidence']}",
                         "",
                         "**Constraint Ranking:**",
                     ]
                     for constraint, sev in weekly_result["ranked_constraints"]:
-                        report_lines.append(f"- {constraint}: {sev}")
+                        report_lines.append(f"- {_ct.get(constraint, constraint)}: {sev}")
 
                     if weekly_result.get("ranked_strategies"):
                         report_lines.append("")
@@ -1489,10 +1562,34 @@ Shorts Ratio: {shorts_ratio}"""
                                 vd_engine = VideoDiagnosisEngine()
                                 vd_result = vd_engine.diagnose(**scope_data)
 
+                                # Cold-start guard — insufficient data
+                                if vd_result.get('primary_constraint') == 'insufficient_data':
+                                    direct = (
+                                        f"## Video Analysis: {v_title}\n\n"
+                                        f"{vd_result['message']}\n\n"
+                                        f"Allow the video to gather more viewer activity before analyzing its performance."
+                                    )
+                                    logger.info(f"[VideoDiagnosisBypass] Cold-start: insufficient data for {v_title}")
+                                    return direct
+
                                 # Sanitize output — strip any non-video keys
                                 vd_result = scope_guard.sanitize_for_llm("video", vd_result)
 
-                                # Build direct response — no LLM
+                                _ct = {
+                                    "ctr": "Low Click Attraction", "retention": "Viewers Leaving Early",
+                                    "conversion": "Low Subscriber Conversion", "shorts": "Shorts Dependency",
+                                    "growth": "Growth Slowdown",
+                                }
+                                _ce = {
+                                    "ctr": "Your thumbnails and titles are not convincing enough viewers to click on the video.",
+                                    "retention": "A noticeable portion of viewers stop watching before reaching the most interesting part of the video.",
+                                    "conversion": "Many viewers watch your content but very few decide to subscribe.",
+                                    "shorts": "Most views are coming from Shorts, which can limit deeper audience engagement.",
+                                    "growth": "The channel's overall growth momentum has started to slow.",
+                                }
+                                _raw_vd = vd_result['primary_constraint']
+                                _display_vd = _ct.get(_raw_vd, _raw_vd)
+                                _explain_vd = _ce.get(_raw_vd, "")
                                 direct = (
                                     f"## Video Analysis: {v_title}\n\n"
                                     f"**Performance Data**\n"
@@ -1503,11 +1600,13 @@ Shorts Ratio: {shorts_ratio}"""
                                     f"- Likes: {v_likes:,}\n"
                                     f"- Comments: {v_comments:,}\n"
                                     f"- Engagement Rate: {round(v_engagement, 2)}%\n"
-                                    f"\n**Video Diagnosis (deterministic)**\n"
-                                    f"- Primary Constraint: {vd_result['primary_constraint']}\n"
-                                    f"- Severity: {vd_result['severity_score']}\n"
-                                    f"- Risk Vector: {', '.join(vd_result['risk_vector']) if vd_result['risk_vector'] else 'none'}\n"
-                                    f"- Format: {vd_result['format_type']}\n"
+                                    f"\n**Video Diagnosis**\n"
+                                    f"- Primary Constraint: {_display_vd}\n"
+                                )
+                                if _explain_vd:
+                                    direct += f"\n{_explain_vd}\n\n"
+                                direct += (
+                                    f"- Severity: {self.severity_label(vd_result['severity_score'])}\n"
                                     f"- Confidence: {vd_result['confidence']}\n"
                                 )
 
@@ -1556,6 +1655,7 @@ Shorts Ratio: {shorts_ratio}"""
         archetype_section = ""
         strategy_ranking_section = ""
         retention_diagnosis_section = ""
+        next_video_blueprint_section = ""
         if plan.intent_classification in ("insight", "analytics", "structural_analysis") and channel_uuid:
             try:
                 archetype = self._compute_archetype(channel_uuid)
@@ -1651,6 +1751,24 @@ Primary Focus: {primary_focus}"""
                         result = ranker.rank(metrics)
                         strategy_ranking_section = ranker.render(result)
                         logger.info(f"[StrategyRanker] {result.primary_constraint}, severity={result.severity_score}, confidence={result.confidence}")
+
+                        # Generate deterministic next-video blueprint
+                        try:
+                            from analytics.next_video_blueprint_engine import NextVideoBlueprintEngine
+                            blueprint_engine = NextVideoBlueprintEngine()
+                            blueprint = blueprint_engine.generate(result.primary_constraint)
+                            next_video_blueprint_section = (
+                                "\n## Next Video Blueprint\n\n"
+                                f"Direction: {blueprint['next_video_direction']}\n"
+                                f"Opening Approach: {blueprint['opening_approach']}\n"
+                                f"Content Structure: {blueprint['content_structure']}\n"
+                                f"Creator Action: {blueprint['creator_action']}\n"
+                            )
+                            logger.info(f"[NextVideoBlueprint] constraint={result.primary_constraint}, generated")
+                        except Exception as bp_err:
+                            logger.warning(f"[NextVideoBlueprint] Failed: {bp_err}")
+                            next_video_blueprint_section = ""
+
                     except Exception as e:
                         logger.warning(f"[StrategyRanker] Failed: {e}")
                         strategy_ranking_section = ""
@@ -1687,10 +1805,7 @@ Primary Focus: {primary_focus}"""
                             )
                             retention_diagnosis_section = (
                                 f"Retention Diagnosis:\n"
-                                f"- Severity: {diagnosis['severity_score']}\n"
-                                f"- Risk Level: {diagnosis['risk_level']}\n"
-                                f"- Shorts Ratio: {diagnosis['amplifiers']['shorts_ratio']}\n"
-                                f"- Watch Time Ratio: {diagnosis['amplifiers']['watch_time_ratio']}\n"
+                                f"- Severity: {self.severity_label(diagnosis['severity_score'])}\n"
                                 f"- Confidence: {diagnosis['confidence']}"
                             )
                             logger.info(f"[RetentionDiagnosis] severity={diagnosis['severity_score']}, risk={diagnosis['risk_level']}")
@@ -1739,15 +1854,42 @@ Primary Focus: {primary_focus}"""
                         impressions=max(int(tv_impressions), 0),
                         format_type=tv_format,
                     )
-                    video_diagnosis_block = (
-                        f"\nVideo Diagnosis (deterministic):\n"
-                        f"- Primary Constraint: {vd_result['primary_constraint']}\n"
-                        f"- Severity: {vd_result['severity_score']}\n"
-                        f"- Risk Vector: {', '.join(vd_result['risk_vector']) if vd_result['risk_vector'] else 'none'}\n"
-                        f"- Format: {vd_result['format_type']}\n"
-                        f"- Confidence: {vd_result['confidence']}\n"
-                    )
-                    logger.info(f"[VideoDiagnosis] constraint={vd_result['primary_constraint']}, severity={vd_result['severity_score']}")
+
+                    # Cold-start guard — insufficient data
+                    if vd_result.get('primary_constraint') == 'insufficient_data':
+                        video_diagnosis_block = (
+                            f"\nVideo Analysis:\n"
+                            f"{vd_result['message']}\n\n"
+                            f"Allow the video to gather more viewer activity before analyzing its performance.\n"
+                        )
+                        logger.info(f"[VideoDiagnosis] Cold-start: insufficient data")
+                    else:
+                        _ct = {
+                            "ctr": "Low Click Attraction", "retention": "Viewers Leaving Early",
+                            "conversion": "Low Subscriber Conversion", "shorts": "Shorts Dependency",
+                            "growth": "Growth Slowdown",
+                        }
+                        _ce = {
+                            "ctr": "Your thumbnails and titles are not convincing enough viewers to click on the video.",
+                            "retention": "A noticeable portion of viewers stop watching before reaching the most interesting part of the video.",
+                            "conversion": "Many viewers watch your content but very few decide to subscribe.",
+                            "shorts": "Most views are coming from Shorts, which can limit deeper audience engagement.",
+                            "growth": "The channel's overall growth momentum has started to slow.",
+                        }
+                        _raw_vd2 = vd_result['primary_constraint']
+                        _display_vd2 = _ct.get(_raw_vd2, _raw_vd2)
+                        _explain_vd2 = _ce.get(_raw_vd2, "")
+                        video_diagnosis_block = (
+                            f"\nVideo Diagnosis:\n"
+                            f"- Primary Constraint: {_display_vd2}\n"
+                        )
+                        if _explain_vd2:
+                            video_diagnosis_block += f"\n{_explain_vd2}\n\n"
+                        video_diagnosis_block += (
+                            f"- Severity: {self.severity_label(vd_result['severity_score'])}\n"
+                            f"- Confidence: {vd_result['confidence']}\n"
+                        )
+                        logger.info(f"[VideoDiagnosis] constraint={vd_result['primary_constraint']}, severity={vd_result['severity_score']}")
             except Exception as e:
                 logger.warning(f"[VideoDiagnosis] Failed: {e}")
 
@@ -2007,27 +2149,25 @@ Do not:
 - Add any sections beyond the six specified above"""
                 elif is_content_strategy:
                     instructions_block = """Instructions:
-- The user is asking a CONTENT STRATEGY question — "What should I upload next?"
-- Follow the CONTENT STRATEGY TEMPLATE from the analysis prompt.
-- Lead with the Data Signal: what does the data reveal about audience behavior?
-- Give a decisive Strategic Direction: should the creator double down or pivot?
-- Propose a concrete Next Video Concept with an emotional angle, not a vague theme.
-- Include a Hook Script (first 5 seconds), 3 Title Options, and Thumbnail Direction.
-- Recommend Format + Duration based on retention data.
-- Set measurable Success Metrics.
-- Do NOT start with a Growth Bottleneck Diagnosis — this is a creative strategy response.
-- Do NOT use generic suggestions like "try trending topics."
+- The user is asking a CONTENT STRATEGY question.
+- Use ONLY the Next Video Blueprint section provided above to answer.
+- Translate each blueprint field into a clear creator-friendly explanation.
+- Respond with these sections only: Strategic Direction, Next Upload Focus, Opening, Structure, Action Step.
+- Each section should be 1-2 sentences translating the corresponding blueprint field.
+- Do not invent video titles, hook scripts, thumbnail concepts, or hypothetical video ideas.
+- Do not introduce metrics or numbers not present in the data.
+- Do not use phrases like "Top 5", "You Won't Believe", or any clickbait examples.
 - No markdown tables. No raw JSON. No emoji.
-- Tone: creative strategist who knows the data inside-out."""
+- Tone: strategic advisor translating a performance blueprint into practical guidance."""
                 elif is_growth_query:
                     instructions_block = """Format this cleanly.
-Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Describe the channel's current growth challenge in plain language. Do not use internal classification labels.
 Then output the strategy ranking section exactly as provided.
 No additional commentary. No expansion. No motivational content. No examples.
 Stop after Confidence line."""
                 else:
                     instructions_block = """Format this cleanly.
-Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Describe the channel's current growth challenge in plain language. Do not use internal classification labels.
 Then output the strategy ranking section exactly as provided.
 No additional commentary. No expansion. No motivational content. No examples.
 Stop after Confidence line."""
@@ -2035,7 +2175,7 @@ Stop after Confidence line."""
                 # If archetype context is available, use minimal formatting
                 if archetype_section:
                     instructions_block = """Format this cleanly.
-Start with: "As a {Theme Type}, {Growth Constraint} channel..." using ARCHETYPE CONTEXT values.
+Describe the channel's current growth challenge in plain language. Do not use internal classification labels.
 Then output the strategy ranking section exactly as provided.
 No additional commentary. No expansion. No motivational content. No examples.
 Stop after Confidence line."""
@@ -2078,19 +2218,27 @@ Forbidden in channel-level responses:
                 archetype_opening = ""
                 if archetype_section and hasattr(self, '_last_archetype'):
                     a = self._last_archetype
-                    archetype_opening = (
-                        f"As a {a.get('theme_type', 'Theme-Concentrated')}, "
-                        f"{a.get('growth_constraint', 'Retention-Constrained')} channel:\n\n"
-                    )
+                    archetype_opening = self._translate_archetype(a) + "\n\n"
 
-                # Append retention diagnosis if available
-                diag_block = ""
-                if retention_diagnosis_section:
-                    diag_block = f"\n\n{retention_diagnosis_section}"
-
-                direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}{diag_block}"
-                logger.info(f"[StrategyBypass] Returning pre-computed ranking + diagnosis directly — NO LLM call")
+                direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}"
+                logger.info(f"[StrategyBypass] Returning pre-computed ranking directly — NO LLM call")
                 return direct_response
+
+        # ──────────────────────────────────────────────
+        # LLM BYPASS — Content Strategy with Blueprint
+        # If blueprint is available for content strategy queries, return directly.
+        # ──────────────────────────────────────────────
+        if is_content_strategy and next_video_blueprint_section and strategy_ranking_section:
+            archetype_opening = ""
+            if archetype_section and hasattr(self, '_last_archetype'):
+                a = self._last_archetype
+                archetype_opening = self._translate_archetype(a) + "\n\n"
+            diag_block = ""
+            if retention_diagnosis_section:
+                diag_block = f"\n\n{retention_diagnosis_section}"
+            direct_response = f"{archetype_opening}## Strategy Ranking\n\n{strategy_ranking_section}\n{next_video_blueprint_section}{diag_block}"
+            logger.info(f"[ContentStrategyBypass] Returning blueprint + ranking directly — NO LLM call")
+            return direct_response
 
         # ──────────────────────────────────────────────
         # Standard LLM path (non-strategy queries)
@@ -2112,6 +2260,8 @@ Forbidden in channel-level responses:
 {archetype_section}
 
 {strategy_ranking_section}
+
+{next_video_blueprint_section}
 
 {retention_diagnosis_section}
 
@@ -2787,6 +2937,14 @@ User message: {clean_message}
                 return True
         return False
 
+    def _is_conversational_name_query(self, message: str) -> bool:
+        """Check if user is asking about their name/channel name."""
+        lower = message.lower().strip()
+        for pattern in self.CONVERSATIONAL_NAME_PATTERNS:
+            if re.search(pattern, lower):
+                return True
+        return False
+
     def _compute_and_render_archetype(self, channel_uuid) -> Optional[str]:
         """
         Compute channel archetype and render as deterministic text block.
@@ -3067,6 +3225,46 @@ User message: {clean_message}
             structured["comparison_7d"] = comparison
 
         return structured
+
+    def _translate_archetype(self, archetype: dict) -> str:
+        """
+        Translate internal archetype labels into creator-friendly language.
+
+        Internal labels like Theme-Concentrated or Retention-Constrained
+        are diagnostic terms that should not appear in user-facing responses.
+        """
+        constraint_translations = {
+            "Retention-Constrained": "Your channel is currently struggling to keep viewers watching through the video.",
+            "Conversion-Constrained": "Your channel receives views but converts very few viewers into subscribers.",
+            "CTR-Constrained": "Your channel struggles to attract clicks from impressions.",
+            "Shorts-Dominant": "Your channel relies heavily on Shorts, which limits longer-form growth.",
+            "Growth-Stalled": "Your channel growth has plateaued and needs a strategic shift.",
+        }
+
+        theme_translations = {
+            "Theme-Concentrated": "focused on a single content theme",
+            "Theme-Diverse": "exploring multiple content themes",
+            "Theme-Emerging": "still establishing a content direction",
+        }
+
+        growth_constraint = archetype.get("growth_constraint", "")
+        theme_type = archetype.get("theme_type", "")
+
+        # Use constraint translation if available
+        if growth_constraint in constraint_translations:
+            return constraint_translations[growth_constraint]
+
+        # Fallback: build from parts without internal labels
+        theme_desc = theme_translations.get(theme_type, "")
+        if theme_desc and growth_constraint:
+            # Generic fallback for unknown constraint
+            return f"Your channel is {theme_desc} and facing growth challenges."
+        elif growth_constraint:
+            return f"Your channel is currently facing {growth_constraint.lower().replace('-', ' ')} challenges."
+        elif theme_desc:
+            return f"Your channel is {theme_desc}."
+
+        return "Your channel is facing growth challenges that require strategic focus."
 
     def _is_content_strategy_query(
         self, message: str, intent: str

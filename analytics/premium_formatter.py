@@ -31,9 +31,56 @@ class PremiumOutputFormatter:
     ALLOWED_KEYS = {
         "primary_constraint",
         "severity",
-        "risk_level",
         "ranked_strategies",
         "confidence",
+        "video_title",
+    }
+
+    CONSTRAINT_TRANSLATIONS = {
+        "ctr": {
+            "title": "Low Click Attraction",
+            "explanation": "Your thumbnails and titles are not convincing enough viewers to click on the video.",
+        },
+        "retention": {
+            "title": "Viewers Leaving Early",
+            "explanation": "A noticeable portion of viewers stop watching before reaching the most interesting part of the video.",
+        },
+        "conversion": {
+            "title": "Low Subscriber Conversion",
+            "explanation": "Many viewers watch your content but very few decide to subscribe.",
+        },
+        "shorts": {
+            "title": "Shorts Dependency",
+            "explanation": "Most views are coming from Shorts, which can limit deeper audience engagement.",
+        },
+        "growth": {
+            "title": "Growth Slowdown",
+            "explanation": "The channel's overall growth momentum has started to slow.",
+        },
+    }
+
+    CONSTRAINT_SUGGESTIONS = {
+        "ctr": (
+            "Update the title and thumbnail to highlight the most exciting "
+            "visual moment from the video so viewers immediately understand "
+            "what they will see."
+        ),
+        "retention": (
+            "Move the most interesting moment to the beginning of the video "
+            "and remove slow introductions."
+        ),
+        "conversion": (
+            "Add a clear moment in the video where viewers are encouraged "
+            "to subscribe after delivering value."
+        ),
+        "shorts": (
+            "Create a longer-form companion video that expands on the topic "
+            "of your best-performing Short to build deeper engagement."
+        ),
+        "growth": (
+            "Analyze your top 3 performing videos and create new content "
+            "that follows the same format and topic patterns."
+        ),
     }
 
     def __init__(self, client=None):
@@ -64,9 +111,10 @@ class PremiumOutputFormatter:
             if k in structured_state
         }
 
-        # Validate all required keys present
-        if not self.ALLOWED_KEYS.issubset(state.keys()):
-            missing = self.ALLOWED_KEYS - set(state.keys())
+        # video_title is optional — do not require it
+        required_keys = self.ALLOWED_KEYS - {"video_title"}
+        if not required_keys.issubset(state.keys()):
+            missing = required_keys - set(state.keys())
             logger.warning(f"[PremiumFormatter] Missing keys: {missing}")
             return "Structured intelligence state incomplete."
 
@@ -97,13 +145,43 @@ class PremiumOutputFormatter:
 
     def _build_prompt(self, state: dict) -> str:
         """Build user prompt from filtered structured state."""
-        lines = [
-            f"Primary Constraint: {state['primary_constraint']}",
+        raw_constraint = state["primary_constraint"]
+        translation = self.CONSTRAINT_TRANSLATIONS.get(
+            raw_constraint.lower(), None
+        )
+
+        if translation:
+            constraint_display = translation["title"]
+            explanation = translation["explanation"]
+        else:
+            constraint_display = raw_constraint
+            explanation = ""
+
+        lines = []
+
+        # Prepend video title if available
+        video_title = state.get("video_title")
+        if video_title:
+            lines.append(f"Video Analysis: {video_title}")
+            lines.append("")
+
+        lines.append(f"Primary Constraint: {constraint_display}")
+        if explanation:
+            lines.append(f"\n{explanation}\n")
+
+        # Deterministic improvement suggestion based on constraint
+        suggestion = self.CONSTRAINT_SUGGESTIONS.get(
+            raw_constraint.lower(), ""
+        )
+        if suggestion:
+            lines.append("**Suggested Improvement for This Video**")
+            lines.append(f"\n{suggestion}\n")
+
+        lines.extend([
             f"Severity: {state['severity']}",
-            f"Risk Level: {state['risk_level']}",
             "",
             "Ranked Strategies:",
-        ]
+        ])
 
         for i, strategy in enumerate(state["ranked_strategies"], 1):
             if isinstance(strategy, dict):

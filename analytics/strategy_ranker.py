@@ -308,11 +308,38 @@ class StrategyRankingEngine:
     # Render for LLM (minimal)
     # -------------------------
 
+    # Constraint-to-creator-friendly translation (presentation only)
+    CONSTRAINT_DISPLAY = {
+        "ctr": "Low Click Attraction",
+        "retention": "Viewers Leaving Early",
+        "conversion": "Low Subscriber Conversion",
+        "shorts": "Shorts Dependency",
+        "growth": "Growth Slowdown",
+    }
+
     def render(self, result: StrategyResult) -> str:
         """Render pre-computed result for LLM formatting. No commentary."""
+        display_constraint = self.CONSTRAINT_DISPLAY.get(
+            result.primary_constraint, result.primary_constraint
+        )
+        sev = result.severity_score
+        try:
+            sev_f = float(sev)
+            if sev_f >= 0.9:
+                sev_label = "Critical"
+            elif sev_f >= 0.7:
+                sev_label = "High"
+            elif sev_f >= 0.5:
+                sev_label = "Moderate"
+            elif sev_f >= 0.3:
+                sev_label = "Early Warning"
+            else:
+                sev_label = "Stable"
+        except (TypeError, ValueError):
+            sev_label = str(sev)
         lines = [
-            f"Primary Constraint: {result.primary_constraint}",
-            f"Severity Score: {result.severity_score}",
+            f"Primary Constraint: {display_constraint}",
+            f"Severity Score: {sev_label}",
             "",
             "Strategies:",
         ]
